@@ -6,3 +6,7 @@ __pycache__/
 
 # macOS / editor noise
 .DS_Store
+
+emsdk
+
+runs/

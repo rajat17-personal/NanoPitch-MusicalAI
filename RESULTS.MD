@@ -57,6 +57,10 @@ python update_results.py --delete <row_label>
 | 36 | `seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad_gru128` | `--gru-size`=128, `--seq-len`=600, `--epochs`=100, `--batch-size`=16, `--w-vad`=0.001, `--w-pitch`=2, `--vad-loss`=focal, `--vad-pos-weight`=0.6, `--scheduler`=cosine_warmup, `--vad-target`=clean_vad, `--augment`=noise_specaug, `--snr-range`=-10 30, `--pitch-sigma`=0.8 | _tbd_ | 91.5 (+12.1) | 96.1 (+5.0) | 71.9 (+6.0) | 20.9 (-8.7) |
 | 37 | `seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad_gru128-resume` | `--gru-size`=128, `--seq-len`=600, `--epochs`=100, `--batch-size`=16, `--lr`=0.0003, `--w-vad`=0.001, `--w-pitch`=2, `--vad-loss`=focal, `--vad-pos-weight`=0.6, `--scheduler`=cosine_warmup, `--vad-target`=clean_vad, `--augment`=noise_specaug, `--snr-range`=-10 30, `--pitch-sigma`=0.8, `--resume`=seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad_gru128 | _tbd_ | 91.5 (+12.1) | 96.1 (+5.0) | 71.7 (+5.8) | 20.5 (-9.1) |
 | 38 | `seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad_gru128-resume2` | `--gru-size`=128, `--seq-len`=600, `--epochs`=100, `--batch-size`=16, `--w-vad`=0.001, `--w-pitch`=2, `--vad-loss`=focal, `--vad-pos-weight`=0.6, `--scheduler`=cosine_warmup, `--vad-target`=clean_vad, `--augment`=noise_specaug, `--snr-range`=-10 30, `--pitch-sigma`=0.8, `--resume`=seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad_gru128 | _tbd_ | 91.3 (+11.9) | 96.2 (+5.1) | 71.7 (+5.8) | 20.6 (-9.0) |
+| 39 | `resume` | `--gru-size`=128, `--seq-len`=600, `--epochs`=100, `--batch-size`=16, `--w-vad`=0.001, `--w-pitch`=2, `--vad-loss`=focal, `--vad-pos-weight`=0.6, `--scheduler`=cosine_warmup, `--vad-target`=clean_vad, `--augment`=noise_specaug, `--snr-range`=-10 30, `--pitch-sigma`=0.8, `--resume`=seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad_gru128 | _tbd_ | 91.3 (+11.9) | 96.2 (+5.1) | 71.7 (+5.8) | 20.6 (-9.0) |
+| 40 | `seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.6_cleanvad_gru128` | `--gru-size`=128, `--seq-len`=600, `--epochs`=100, `--batch-size`=16, `--w-vad`=0.001, `--w-pitch`=2, `--vad-loss`=focal, `--vad-pos-weight`=0.6, `--scheduler`=cosine_warmup, `--vad-target`=clean_vad, `--augment`=noise_specaug, `--snr-range`=-10 30, `--pitch-sigma`=0.6 | _tbd_ | 91.6 (+12.2) | 96.3 (+5.2) | 65.4 (-0.5) | 22.5 (-7.1) |
+| 41 | `seq600_btch16_wVad0.001wPitch3_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad_gru128` | `--gru-size`=128, `--seq-len`=600, `--epochs`=100, `--batch-size`=16, `--w-vad`=0.001, `--w-pitch`=3, `--vad-loss`=focal, `--vad-pos-weight`=0.6, `--scheduler`=cosine_warmup, `--vad-target`=clean_vad, `--augment`=noise_specaug, `--snr-range`=-10 30, `--pitch-sigma`=0.8 | _tbd_ | 91.5 (+12.1) | 95.8 (+4.7) | 71.5 (+5.6) | 21.9 (-7.7) |
+| 42 | `seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad_gru128_curr` | `--gru-size`=128, `--seq-len`=600, `--epochs`=100, `--batch-size`=16, `--w-vad`=0.001, `--w-pitch`=2, `--vad-loss`=focal, `--vad-pos-weight`=0.6, `--scheduler`=cosine_warmup, `--vad-target`=clean_vad, `--augment`=noise_specaug, `--snr-range`=-10 30, `--pitch-sigma`=0.8, `--curriculum`=on | _tbd_ | 87.9 (+8.5) | 94.3 (+3.2) | 65.6 (-0.3) | 25.8 (-3.8) |
 
 ## Per-condition rtRPA
 
@@ -68,13 +72,16 @@ Realtime (browser) RPA per SNR condition. "Macro" is the mean over all clips (= 
 | 24 | `seq600_btch16_wVad0.2wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8` | 97.2 | 96.0 | 95.8 | 97.8 | 97.9 | 97.8 | 97.1 |
 | 25 | `seq600_btch16_wVad0.1wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8` | 96.7 | 95.4 | 95.4 | 97.7 | 97.9 | 98.5 | 96.9 |
 | 27 | `seq600_btch16_wVad0.2wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad` | 95.6 | 94.1 | 95.5 | 97.8 | 97.8 | 98.4 | 96.6 |
+| 40 | `seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.6_cleanvad_gru128` | 94.7 | 93.8 | 95.4 | 98.1 | 97.2 | 98.3 | 96.3 |
 | 38 | `seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad_gru128-resume2` | 94.6 | 93.5 | 96.0 | 97.6 | 97.5 | 97.9 | 96.2 |
+| 39 | `resume` | 94.6 | 93.5 | 96.0 | 97.6 | 97.5 | 97.9 | 96.2 |
 | 26 | `seq600_btch16_wVad0.05wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8` | 95.1 | 94.3 | 94.4 | 96.9 | 97.9 | 98.1 | 96.1 |
 | 36 | `seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad_gru128` | 94.2 | 93.7 | 95.5 | 97.5 | 97.6 | 98.0 | 96.1 |
 | 37 | `seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad_gru128-resume` | 94.2 | 93.6 | 95.5 | 97.6 | 97.6 | 98.1 | 96.1 |
 | 28 | `seq600_btch16_wVad0.01wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad` | 93.6 | 93.1 | 96.1 | 97.4 | 96.6 | 98.2 | 95.9 |
 | 30 | `seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad` | 94.8 | 93.1 | 95.8 | 97.6 | 96.3 | 98.0 | 95.9 |
 | 29 | `seq600_btch16_wVad0.05wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad_focal_vadposw0.6` | 94.3 | 93.5 | 95.2 | 97.6 | 95.8 | 98.1 | 95.8 |
+| 41 | `seq600_btch16_wVad0.001wPitch3_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad_gru128` | 94.8 | 92.6 | 95.8 | 97.4 | 96.6 | 97.7 | 95.8 |
 | 31 | `seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad_focal_posw04` | 94.4 | 93.4 | 95.0 | 97.1 | 96.3 | 97.6 | 95.7 |
 | 35 | `seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma1.0_cleanvad_gru128` | 94.0 | 92.9 | 95.2 | 96.9 | 96.0 | 97.4 | 95.4 |
 | 34 | `seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma1.0_cleanvad` | 94.3 | 92.0 | 95.2 | 96.7 | 95.3 | 97.4 | 95.2 |
@@ -87,6 +94,7 @@ Realtime (browser) RPA per SNR condition. "Macro" is the mean over all clips (= 
 | 17 | `seq600_btch16_wVad0.2wPitch2_cosine_specaug_n10t30SNR_vadfocal` | 93.0 | 93.8 | 93.5 | 95.3 | 94.2 | 96.9 | 94.5 |
 | 11 | `specaug_wpitch2.0_cosine_100Epochs_snr07_n10t30snr_seq400` | 93.0 | 92.1 | 93.9 | 95.0 | 94.4 | 97.3 | 94.3 |
 | 32 | `seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_cleanvad` | 93.0 | 90.8 | 94.3 | 95.6 | 95.2 | 96.9 | 94.3 |
+| 42 | `seq600_btch16_wVad0.001wPitch2_cosine_specaug_n10t30SNR_pitchsigma0.8_cleanvad_gru128_curr` | 93.7 | 92.1 | 94.1 | 94.8 | 94.2 | 96.9 | 94.3 |
 | 7 | `specnoiseaug_wpitch2_wvad2_cosine` | 92.8 | 92.4 | 92.4 | 95.5 | 94.4 | 97.0 | 94.1 |
 | 16 | `seq600_btch16_wVad0.2wPitch2_cosine_specaug_n10t30SNR_poswvad0.6` | 93.0 | 92.0 | 93.1 | 95.6 | 93.8 | 97.0 | 94.1 |
 | 5 | `noise_wpitch2.0_cosine` | 92.3 | 90.8 | 92.6 | 95.4 | 95.6 | 96.4 | 93.9 |
