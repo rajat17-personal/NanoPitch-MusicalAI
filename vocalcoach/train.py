@@ -173,6 +173,12 @@ parser.add_argument("--freeze-backbone-epochs", type=int, default=0,
                          "so only the technique head trains. Backbone unfreezes after N epochs "
                          "for joint fine-tuning. Use with --resume from a pitch-only checkpoint. "
                          "Rule of thumb: 20-30 epochs of frozen technique head, then unfreeze.")
+parser.add_argument("--probe-mode", action="store_true",
+                    help="MERT-style linear probing: freeze backbone AND pitch/VAD heads forever. "
+                         "Only head_technique is trainable for the entire run. "
+                         "Use with --resume from a pitch-only checkpoint (e.g. Run 4). "
+                         "Pitch/VAD heads never see technique data — zero distribution drift. "
+                         "Incompatible with --freeze-backbone-epochs.")
 
 # Curriculum training (Option 3 — phase loss weights)
 parser.add_argument("--curriculum", action="store_true",
@@ -587,19 +593,31 @@ def _get_w_technique(epoch, args):
     return args.w_technique * ramp_progress / args.curriculum_ramp
 
 
-def _set_backbone_frozen(model, frozen: bool):
-    """Freeze or unfreeze backbone weights (everything except the three output heads).
+def _set_backbone_frozen(model, frozen: bool, probe_mode: bool = False):
+    """Freeze or unfreeze backbone weights.
 
-    Technique gradients flow only through head_technique when frozen=True,
-    preventing them from eroding the pitch representations built in stage 1.
-    The VAD and pitch heads remain trainable so they can continue to refine.
+    probe_mode=True: freeze backbone + pitch/VAD heads; only head_technique trains.
+      This is the MERT linear-probing setup — pitch/VAD heads never see technique
+      data so there is zero distribution drift on the pitch evaluation set.
+
+    probe_mode=False (default): freeze backbone only; pitch/VAD heads stay trainable.
+      Used for staged training where pitch/VAD heads continue refining.
     """
-    head_names = {"head_vad", "head_pitch", "head_technique"}
+    if probe_mode:
+        trainable_tops = {"head_technique"}
+    elif frozen:
+        trainable_tops = {"head_vad", "head_pitch", "head_technique"}
+    else:
+        trainable_tops = None  # unfreeze everything
+
     for name, param in model.named_parameters():
         top = name.split(".")[0]
-        if top not in head_names:
-            param.requires_grad = not frozen
-    state = "FROZEN" if frozen else "unfrozen"
+        if trainable_tops is None:
+            param.requires_grad = True
+        else:
+            param.requires_grad = (top in trainable_tops)
+
+    state = "FROZEN" if (frozen or probe_mode) else "unfrozen"
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Backbone {state} — {trainable:,} trainable parameters")
 
@@ -898,14 +916,23 @@ def main():
     patience_count = 0
     global_step    = 0
 
+    if args.probe_mode:
+        _set_backbone_frozen(model, frozen=True, probe_mode=True)
+        print(f"  Probe mode: backbone + pitch/VAD heads frozen for all {args.epochs} epochs")
+        # Rebuild optimizer over trainable params only so frozen params get no momentum state
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=args.lr, betas=(0.9, 0.98), weight_decay=1e-4,
+        )
+
     freeze_until = start_epoch + args.freeze_backbone_epochs
-    if args.freeze_backbone_epochs > 0:
+    if not args.probe_mode and args.freeze_backbone_epochs > 0:
         _set_backbone_frozen(model, frozen=True)
         print(f"  Backbone frozen for epochs {start_epoch}–{freeze_until - 1}, "
               f"unfreezes at epoch {freeze_until}")
 
     for epoch in range(start_epoch, start_epoch + args.epochs):
-        if args.freeze_backbone_epochs > 0 and epoch == freeze_until:
+        if not args.probe_mode and args.freeze_backbone_epochs > 0 and epoch == freeze_until:
             _set_backbone_frozen(model, frozen=False)
             print(f"  Epoch {epoch}: backbone unfrozen — joint fine-tuning begins")
 
