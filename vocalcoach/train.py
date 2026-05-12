@@ -74,7 +74,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import f1_score, average_precision_score
+from sklearn.metrics import average_precision_score, precision_recall_fscore_support
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -93,11 +93,15 @@ from vocalcoach.model import (
 parser = argparse.ArgumentParser(description="VocalCoach multi-task trainer")
 
 # Paths
-parser.add_argument("--data-dir", type=str, default="../data",
-                    help="directory with clean.npz (mel/f0/vad) and optional test.npz")
-parser.add_argument("--technique-dir", type=str, default=None,
-                    help="directory with technique.npz (mel/technique/f0/vad); "
-                         "if None, technique head is trained on pseudo-labels (zeros)")
+parser.add_argument("--data-dir", type=str, default=None,
+                    help="directory with clean.npz (mel/f0/vad) and optional test.npz. "
+                         "Omit to train on technique clips only (all heads still train "
+                         "via f0/vad labels in technique_train.npz).")
+parser.add_argument("--technique-dirs", type=str, nargs="*", default=None,
+                    help="one or more directories containing technique_train.npz "
+                         "(e.g. data/vocalset data/gtsinger_technique). "
+                         "Datasets are concatenated. If None, technique head "
+                         "trains on pseudo-labels (zeros).")
 parser.add_argument("--output-dir", type=str, default="./runs/default",
                     help="where to save checkpoints and TensorBoard logs")
 parser.add_argument("--resume", type=str, default=None,
@@ -119,16 +123,16 @@ parser.add_argument("--n-blocks", type=int, default=None,
                          "(default: 8 for TCN, 4 for Conformer)")
 
 # Device
-parser.add_argument("--device", type=str, default="auto",
+parser.add_argument("--device", type=str, default="cuda",
                     help="cpu / cuda / mps / auto")
 
 # Hyperparameters
-parser.add_argument("--epochs", type=int, default=80)
+parser.add_argument("--epochs", type=int, default=100)
 parser.add_argument("--batch-size", type=int, default=32)
 parser.add_argument("--lr", type=float, default=3e-4)
 parser.add_argument("--seq-len", type=int, default=300,
                     help="training clip length in frames (300 = 3 seconds)")
-parser.add_argument("--num-workers", type=int, default=4)
+parser.add_argument("--num-workers", type=int, default=2)
 parser.add_argument("--scheduler", type=str, default="cosine_warmup",
                     choices=["constant", "cosine_warmup"],
                     help="LR schedule")
@@ -151,6 +155,32 @@ parser.add_argument("--technique-clip-weight", type=float, default=1.0,
                     help="relative weight of clip-level technique loss vs frame-level; "
                          "used when --technique-dir provides clip-level labels only")
 
+# Per-class technique positive weights (Option 1 — class rebalancing)
+parser.add_argument("--technique-pos-weights", type=float, nargs=5,
+                    default=[2.9, 4.2, 1.0, 4.0, 1.9],
+                    metavar=("VIB", "BRE", "FAL", "BELT", "STR"),
+                    help="Per-class BCE positive weights for technique head "
+                         "(n_neg/n_pos per class). Order: vibrato breathy falsetto belt straight. "
+                         "Recompute if the technique dataset changes:\n"
+                         "  VocalSet only (824 clips):          2.9  4.2  inf  4.0  1.9\n"
+                         "  GTSinger-tech only (9601 clips):    1.9  3.3  1.0  inf  inf\n"
+                         "  VocalSet + GTSinger (default):      2.9  4.2  1.0  4.0  1.9\n"
+                         "  (inf = class absent; set to 1.0 to ignore that class)")
+
+# Curriculum training (Option 3 — phase loss weights)
+parser.add_argument("--curriculum", action="store_true",
+                    help="Enable curriculum training: technique loss weight is zeroed "
+                         "for the first --curriculum-warmup epochs, then linearly ramped "
+                         "to --w-technique over --curriculum-ramp epochs. "
+                         "Pitch/VAD heads converge before technique gradients compete. "
+                         "The LR schedule runs unaffected — only w_technique changes.")
+parser.add_argument("--curriculum-warmup", type=int, default=30,
+                    help="epochs to train pitch+VAD only before enabling technique loss "
+                         "(--curriculum only). Rule of thumb: set to ~30%% of total epochs.")
+parser.add_argument("--curriculum-ramp", type=int, default=10,
+                    help="epochs over which w_technique linearly ramps from 0 to its "
+                         "target value (--curriculum only).")
+
 # Pitch supervision
 parser.add_argument("--pitch-sigma", type=float, default=1.2,
                     help="Gaussian sigma (bins) for pitch posteriorgram target")
@@ -160,12 +190,38 @@ parser.add_argument("--eval-every", type=int, default=5,
                     help="run evaluation every N epochs")
 
 # Early stopping
-parser.add_argument("--patience", type=int, default=20,
+parser.add_argument("--patience", type=int, default=0,
                     help="stop if macro technique F1 does not improve for N epochs "
                          "(0 = disabled)")
 
 # Gradient clipping
 parser.add_argument("--grad-clip", type=float, default=5.0)
+
+# Noise augmentation
+parser.add_argument("--augment", type=str, default="none",
+                    choices=["none", "noise", "noise_specaug"],
+                    help="'none' = clean-only (NanoPitch baseline comparison). "
+                         "'noise' = log-mel noise mixing only (logaddexp). "
+                         "'noise_specaug' = noise mixing + SpecAugment.")
+parser.add_argument("--noise-dir", type=str, default=None,
+                    help="directory containing noise.npz "
+                         "(defaults to --data-dir if not set)")
+parser.add_argument("--snr-range", type=float, nargs=2, default=[-10.0, 30.0],
+                    help="min/max SNR in dB for noise mixing")
+parser.add_argument("--p-clean", type=float, default=0.0,
+                    help="fraction of batch rows passed through without noise "
+                         "(0=always mix, 0.1=10%% rows stay clean)")
+parser.add_argument("--snr-bias", type=float, default=1.0,
+                    help="SNR draw exponent: <1 biases toward high SNR (cleaner), "
+                         ">1 toward low SNR (noisier). 1.0 = uniform.")
+parser.add_argument("--freq-mask-param", type=int, default=4,
+                    help="SpecAugment: max mel-band width per frequency mask")
+parser.add_argument("--n-freq-masks", type=int, default=2,
+                    help="SpecAugment: number of frequency masks per sample")
+parser.add_argument("--time-mask-param", type=int, default=10,
+                    help="SpecAugment: max frame width per time mask")
+parser.add_argument("--n-time-masks", type=int, default=2,
+                    help="SpecAugment: number of time masks per sample")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -183,9 +239,10 @@ class PitchVADDataset(Dataset):
     def __init__(self, data_dir, seq_len=300):
         self.seq_len = seq_len
         clean = np.load(os.path.join(data_dir, "clean.npz"))
-        self.mel = clean["mel"].astype(np.float32)      # (total_frames, 40)
-        self.f0  = clean["f0"].astype(np.float32)       # (total_frames,)
-        self.vad = clean["vad"].astype(np.float32)      # (total_frames,)
+        # Keep float16 in RAM — 2× smaller than float32. Cast on slice in __getitem__.
+        self.mel = clean["mel"]                          # (total_frames, 40) float16
+        self.f0  = clean["f0"]                          # (total_frames,)    float16
+        self.vad = clean["vad"]                         # (total_frames,)    float16
         lengths  = clean["lengths"]
 
         self.segments = []
@@ -196,8 +253,9 @@ class PitchVADDataset(Dataset):
             offset += length
 
         self.rng = np.random.default_rng()
+        mem_mb = (self.mel.nbytes + self.f0.nbytes + self.vad.nbytes) / 1024**2
         print(f"PitchVADDataset: {len(self.mel):,} frames, "
-              f"{len(self.segments)} usable segments")
+              f"{len(self.segments)} usable segments, RAM={mem_mb:.0f} MB")
 
     def __len__(self):
         return min(len(self.segments) * 5, 20000)
@@ -208,103 +266,129 @@ class PitchVADDataset(Dataset):
         t = self.rng.integers(0, e - s - self.seq_len + 1)
         t += s
 
-        mel = self.mel[t:t + self.seq_len]              # (T, 40)
-        f0  = self.f0 [t:t + self.seq_len]              # (T,)
-        vad = self.vad[t:t + self.seq_len]              # (T,)
+        mel = self.mel[t:t + self.seq_len].astype(np.float32)   # (T, 40)
+        f0  = self.f0 [t:t + self.seq_len].astype(np.float32)   # (T,)
+        vad = self.vad[t:t + self.seq_len].astype(np.float32)   # (T,)
         technique = np.zeros((self.seq_len, N_TECHNIQUES), dtype=np.float32)
         has_technique = np.float32(0.0)
         return mel, f0, vad, technique, has_technique
 
 
 class TechniqueDataset(Dataset):
-    """Loads technique.npz for technique classification supervision.
+    """Loads technique_train.npz (flat format from extractVocalSet.py) for
+    technique classification supervision.
 
-    Supports two label formats:
-    - Clip-level: technique.npz with key 'technique' shape (N, N_TECHNIQUES)
-      — labels broadcast over all voiced frames in the clip.
-    - Frame-level: technique.npz with key 'technique' shape (N, T, N_TECHNIQUES)
-      — direct per-frame supervision.
+    Flat format (produced by extractVocalSet.py):
+      mel:       (total_frames, 40)        float16
+      f0:        (total_frames,)           float16
+      vad:       (total_frames,)           float16
+      technique: (n_clips, N_TECHNIQUES)  float32  — clip-level binary labels
+      lengths:   (n_clips,)               int32
 
-    The returned has_technique flag (1.0) tells the collator to include these
-    samples in the technique loss computation.
+    Each __getitem__ samples a random seq_len window from a random clip and
+    broadcasts that clip's technique label over the window.
+    has_technique=1.0 signals the loss function to include these samples in
+    the technique head gradient.
     """
 
-    def __init__(self, technique_dir, seq_len=300):
+    def __init__(self, technique_dir, seq_len=300,
+                 filename="technique_train.npz"):
         self.seq_len = seq_len
-        data = np.load(os.path.join(technique_dir, "technique.npz"))
+        path = os.path.join(technique_dir, filename)
+        data = np.load(path, allow_pickle=False)
 
-        self.mel = data["mel"].astype(np.float32)             # (N, T, 40)
-        technique_raw = data["technique"].astype(np.float32)  # (N, N_TECH) or (N, T, N_TECH)
+        # Keep float16 in RAM — cast to float32 only on slice in __getitem__.
+        self.mel       = data["mel"]                            # (total_frames, 40) float16
+        self.f0        = data["f0"]                            # (total_frames,)    float16
+        self.vad       = data["vad"]                           # (total_frames,)    float16
+        self.technique = data["technique"].astype(np.float32)  # (n_clips, N_TECH) — small
+        lengths        = data["lengths"]
 
-        self.f0  = data["f0"].astype(np.float32)  if "f0"  in data else None
-        self.vad = data["vad"].astype(np.float32) if "vad" in data else None
-
-        # Normalise to (N, T, N_TECHNIQUES)
-        N, T_mel = self.mel.shape[0], self.mel.shape[1]
-        if technique_raw.ndim == 2:
-            # Clip-level: broadcast to (N, T, N_TECH)
-            self.technique = np.broadcast_to(
-                technique_raw[:, np.newaxis, :], (N, T_mel, N_TECHNIQUES)
-            ).copy()
-            self.clip_level = True
-        else:
-            self.technique = technique_raw   # (N, T, N_TECH)
-            self.clip_level = False
+        # Build (flat_start, flat_end, clip_idx) for each clip long enough
+        self.segments = []
+        offset = 0
+        for clip_idx, length in enumerate(lengths):
+            length = int(length)
+            if length >= seq_len:
+                self.segments.append((offset, offset + length, clip_idx))
+            offset += length
 
         self.rng = np.random.default_rng()
-        print(f"TechniqueDataset: {N} clips, seq_len={T_mel}, "
-              f"clip_level={self.clip_level}")
+        voiced_pct = float(np.mean(self.vad > 0)) * 100
+        mem_mb = (self.mel.nbytes + self.f0.nbytes + self.vad.nbytes) / 1024**2
+        print(f"TechniqueDataset ({filename}): {len(lengths)} clips, "
+              f"{len(self.mel):,} frames, voiced={voiced_pct:.1f}%, "
+              f"{len(self.segments)} usable segments, RAM={mem_mb:.0f} MB")
 
     def __len__(self):
-        return len(self.mel) * 3
+        return min(len(self.segments) * 5, 15000)
 
     def __getitem__(self, _):
-        idx = self.rng.integers(len(self.mel))
-        mel = self.mel[idx]                    # (T, 40)
-        T = mel.shape[0]
+        seg_idx = self.rng.integers(len(self.segments))
+        s, e, clip_idx = self.segments[seg_idx]
 
-        # Crop or pad to seq_len
-        if T >= self.seq_len:
-            t0 = self.rng.integers(0, T - self.seq_len + 1)
-            mel = mel[t0:t0 + self.seq_len]
-            technique = self.technique[idx, t0:t0 + self.seq_len]
-            f0  = self.f0 [idx, t0:t0 + self.seq_len] if self.f0  is not None \
-                  else np.zeros(self.seq_len, dtype=np.float32)
-            vad = self.vad[idx, t0:t0 + self.seq_len] if self.vad is not None \
-                  else np.ones(self.seq_len, dtype=np.float32)
-        else:
-            pad = self.seq_len - T
-            mel = np.pad(mel, ((0, pad), (0, 0)))
-            technique = np.pad(self.technique[idx], ((0, pad), (0, 0)))
-            f0  = np.pad(self.f0 [idx], (0, pad)) if self.f0  is not None \
-                  else np.zeros(self.seq_len, dtype=np.float32)
-            vad = np.pad(self.vad[idx], (0, pad)) if self.vad is not None \
-                  else np.concatenate([np.ones(T, dtype=np.float32),
-                                       np.zeros(pad, dtype=np.float32)])
+        t0 = self.rng.integers(0, e - s - self.seq_len + 1) + s
+        mel = self.mel[t0:t0 + self.seq_len].astype(np.float32)
+        f0  = self.f0 [t0:t0 + self.seq_len].astype(np.float32)
+        vad = self.vad[t0:t0 + self.seq_len].astype(np.float32)
+
+        # Broadcast clip-level label over the sampled window
+        clip_label = self.technique[clip_idx]                   # (N_TECH,)
+        technique  = np.broadcast_to(
+            clip_label[np.newaxis, :], (self.seq_len, len(clip_label))
+        ).copy()                                                 # (T, N_TECH)
 
         has_technique = np.float32(1.0)
-        return (mel.astype(np.float32),
-                f0.astype(np.float32),
-                vad.astype(np.float32),
-                technique.astype(np.float32),
-                has_technique)
+        return mel, f0, vad, technique, has_technique
 
 
-def make_joint_loader(pitch_vad_dir, technique_dir, seq_len, batch_size,
+def make_joint_loader(pitch_vad_dir, technique_dirs, seq_len, batch_size,
                       num_workers):
-    """Interleave pitch/VAD and technique batches using ConcatDataset."""
+    """Combine PitchVADDataset and one or more TechniqueDatasets via ConcatDataset.
+
+    pitch_vad_dir: directory with clean.npz, or None to skip (technique-only mode).
+    technique_dirs: list of directories each containing technique_train.npz.
+
+    Technique clips carry f0/vad labels, so all three heads (pitch, VAD, technique)
+    train even when pitch_vad_dir is None. Omitting pitch_vad_dir avoids the overlap
+    where VocalSet/GTSinger clips appear in both clean.npz and technique_train.npz.
+    """
     from torch.utils.data import ConcatDataset
 
-    pv = PitchVADDataset(pitch_vad_dir, seq_len)
-    if technique_dir is not None and os.path.exists(
-            os.path.join(technique_dir, "technique.npz")):
-        tech = TechniqueDataset(technique_dir, seq_len)
-        dataset = ConcatDataset([pv, tech])
-        print(f"Joint dataset: {len(pv)} pitch/VAD + {len(tech)} technique samples")
+    datasets = []
+    if pitch_vad_dir is not None:
+        pv = PitchVADDataset(pitch_vad_dir, seq_len)
+        datasets.append(pv)
+        n_pv = len(pv)
     else:
-        dataset = pv
-        print("No technique.npz found — technique head will train on pseudo-labels.")
+        n_pv = 0
 
+    tech_datasets = []
+    for tech_dir in (technique_dirs or []):
+        tech_path = os.path.join(tech_dir, "technique_train.npz")
+        if os.path.exists(tech_path):
+            tech_datasets.append(
+                TechniqueDataset(tech_dir, seq_len, filename="technique_train.npz")
+            )
+        else:
+            print(f"  [warn] technique_train.npz not found in {tech_dir} — skipping")
+
+    datasets.extend(tech_datasets)
+
+    if not datasets:
+        raise RuntimeError("No training data found — pass --data-dir and/or --technique-dirs.")
+
+    n_tech = sum(len(d) for d in tech_datasets)
+    if n_pv and n_tech:
+        print(f"Joint dataset: {n_pv} pitch/VAD + {n_tech} technique samples "
+              f"({len(tech_datasets)} technique source(s))")
+    elif n_tech:
+        print(f"Technique-only dataset: {n_tech} samples "
+              f"({len(tech_datasets)} source(s)) — pitch/VAD heads train via f0/vad in technique clips")
+    else:
+        print(f"Pitch/VAD-only dataset: {n_pv} samples — technique head trains on pseudo-labels")
+
+    dataset = ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=True, drop_last=True,
         num_workers=num_workers,
@@ -312,6 +396,96 @@ def make_joint_loader(pitch_vad_dir, technique_dir, seq_len, batch_size,
         persistent_workers=(num_workers > 0),
     )
     return loader
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Noise augmentation
+# ═══════════════════════════════════════════════════════════════════════
+
+class NoisePool:
+    """Wraps noise.npz for fast random-window draws during training.
+
+    noise.npz has the same flat layout as clean.npz:
+      mel:     (total_frames, 40)  float16
+      lengths: (n_clips,)          int32
+
+    Draws are independent of the main Dataset — no DataLoader overhead.
+    """
+
+    def __init__(self, noise_dir, seq_len):
+        path = os.path.join(noise_dir, "noise.npz")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"noise.npz not found at {path}. "
+                "Download from huggingface.co/datasets/smulelabs/NanoPitch-PreExtract "
+                "or set --augment none to skip noise mixing.")
+        data = np.load(path)
+        self.mel = data["mel"]                       # (total_frames, 40) float16 — keep small
+        lengths  = data["lengths"]
+        self.segments = []
+        offset = 0
+        for length in lengths:
+            if length >= seq_len:
+                self.segments.append((offset, offset + int(length)))
+            offset += int(length)
+        self.seq_len = seq_len
+        self.rng = np.random.default_rng()
+        total_h = len(self.mel) * 160 / 16000 / 3600
+        mem_mb = self.mel.nbytes / 1024**2
+        print(f"NoisePool: {len(self.mel):,} frames ({total_h:.1f}h), "
+              f"{len(self.segments)} usable segments, RAM={mem_mb:.0f} MB")
+
+    def draw_batch(self, batch_size):
+        """Return (batch_size, seq_len, 40) float32 array of noise windows."""
+        out = np.empty((batch_size, self.seq_len, 40), dtype=np.float32)
+        for i in range(batch_size):
+            idx = self.rng.integers(len(self.segments))
+            s, e = self.segments[idx]
+            t = self.rng.integers(0, e - s - self.seq_len + 1) + s
+            out[i] = self.mel[t:t + self.seq_len]
+        return out
+
+
+def augment_mel_batch(mel_clean, mel_noise, args, device):
+    """Mix clean and noise log-mel at a random SNR per sample.
+
+    Uses logaddexp so mixing is equivalent to linear-domain addition:
+      log(exp(mel_clean) + scale * exp(mel_noise))
+
+    mel_clean, mel_noise: (B, T, 40) tensors on ``device``
+    Returns augmented (B, T, 40) tensor.
+    """
+    B = mel_clean.size(0)
+    u = torch.rand(B, 1, 1, device=device)
+    if args.snr_bias != 1.0:
+        u = u.pow(args.snr_bias)
+    lo, hi = args.snr_range
+    snr_db = u * (hi - lo) + lo
+    gain_offset = -snr_db * (np.log(10.0) / 20.0)
+    mixed = torch.logaddexp(mel_clean, mel_noise + gain_offset)
+    if args.p_clean > 0.0:
+        keep_clean = torch.rand(B, 1, 1, device=device) < args.p_clean
+        mixed = torch.where(keep_clean, mel_clean, mixed)
+    return mixed
+
+
+def spec_augment(mel, args):
+    """SpecAugment: independent random frequency and time masking per sample.
+
+    mel: (B, T, 40) on any device. Returns masked tensor (in-place clone).
+    """
+    mel = mel.clone()
+    B, T, F = mel.shape
+    for b in range(B):
+        for _ in range(args.n_freq_masks):
+            f = torch.randint(1, args.freq_mask_param + 1, (1,)).item()
+            f0 = torch.randint(0, max(F - f, 1), (1,)).item()
+            mel[b, :, f0:f0 + f] = 0.0
+        for _ in range(args.n_time_masks):
+            t = torch.randint(1, args.time_mask_param + 1, (1,)).item()
+            t0 = torch.randint(0, max(T - t, 1), (1,)).item()
+            mel[b, t0:t0 + t, :] = 0.0
+    return mel
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -331,7 +505,7 @@ def _build_pitch_target_gpu(f0_dev, sigma_bins, device):
 
 def compute_loss(pred_vad, pred_pitch, pred_technique,
                  vad_target, f0_target, technique_target, has_technique,
-                 args, device):
+                 args, device, w_technique_override=None):
     """Compute multi-task loss.
 
     Args:
@@ -357,16 +531,32 @@ def compute_loss(pred_vad, pred_pitch, pred_technique,
     pitch_loss = (voiced_mask * bce_none(pred_pitch, pitch_target)).mean()
 
     # ── Technique loss (multi-label BCE, only on samples with labels) ────
+    # Per-class positive weights (Option 1 — class rebalancing).
+    # Upweights minority classes so the model can't win by predicting all-negative.
+    # UPDATE these weights if the technique dataset changes:
+    #   VocalSet only (824 clips):         2.9  4.2  inf  4.0  1.9
+    #   GTSinger-tech only (9601 clips):   1.9  3.3  1.0  inf  inf
+    #   VocalSet + GTSinger (default):     2.9  4.2  1.0  4.0  1.9
+    # (inf = class absent in that dataset; use 1.0 to ignore)
+    tech_pos_w = torch.tensor(args.technique_pos_weights,
+                              dtype=torch.float32, device=device)  # (N,)
+    class_w = torch.where(
+        technique_target > 0.5,
+        tech_pos_w.view(1, 1, -1).expand_as(technique_target),
+        torch.ones_like(technique_target),
+    )                                                               # (B, T, N)
     mask = has_technique.view(-1, 1, 1)                            # (B, 1, 1)
     tech_per_elem = bce_none(pred_technique, technique_target)     # (B, T, N)
     if mask.sum() > 0:
-        technique_loss = (mask * tech_per_elem).sum() / (mask.sum() * tech_per_elem.shape[1] * tech_per_elem.shape[2])
+        technique_loss = (mask * class_w * tech_per_elem).sum() / \
+                         (mask.sum() * tech_per_elem.shape[1] * tech_per_elem.shape[2])
     else:
         technique_loss = torch.tensor(0.0, device=device)
 
+    w_tech = w_technique_override if w_technique_override is not None else args.w_technique
     total = (args.w_vad * vad_loss
              + args.w_pitch * pitch_loss
-             + args.w_technique * technique_loss)
+             + w_tech * technique_loss)
     return total, vad_loss, pitch_loss, technique_loss
 
 
@@ -374,11 +564,31 @@ def compute_loss(pred_vad, pred_pitch, pred_technique,
 # Training loop
 # ═══════════════════════════════════════════════════════════════════════
 
+def _get_w_technique(epoch, args):
+    """Return effective technique loss weight for this epoch (curriculum Option 3).
+
+    When --curriculum is not set, returns args.w_technique unchanged.
+    When set: weight is 0 for the first --curriculum-warmup epochs, then ramps
+    linearly to args.w_technique over --curriculum-ramp epochs.
+    The LR schedule is unaffected — only this scalar changes per epoch.
+    """
+    if not args.curriculum:
+        return args.w_technique
+    if epoch <= args.curriculum_warmup:
+        return 0.0
+    ramp_progress = min(epoch - args.curriculum_warmup, args.curriculum_ramp)
+    return args.w_technique * ramp_progress / args.curriculum_ramp
+
+
 def train_one_epoch(model, loader, optimizer, scheduler, writer,
-                    epoch, device, args, global_step_offset=0):
+                    epoch, device, args, noise_pool=None,
+                    global_step_offset=0):
     model.train()
     running = {'total': 0.0, 'vad': 0.0, 'pitch': 0.0, 'technique': 0.0}
     n_batches = 0
+
+    do_noise    = args.augment in ("noise", "noise_specaug") and noise_pool is not None
+    do_specaug  = args.augment == "noise_specaug"
 
     pbar = tqdm(loader, desc=f"Epoch {epoch}", unit="batch")
     for batch_idx, (mel, f0, vad, technique, has_technique) in enumerate(pbar):
@@ -388,12 +598,22 @@ def train_one_epoch(model, loader, optimizer, scheduler, writer,
         technique     = technique.to(device)
         has_technique = has_technique.to(device)
 
-        pred_vad, pred_pitch, pred_technique = model(mel)
+        if do_noise:
+            B = mel.size(0)
+            noise_np = noise_pool.draw_batch(B)
+            noise_t  = torch.from_numpy(noise_np).to(device)
+            mel = augment_mel_batch(mel, noise_t, args, device)
+        if do_specaug:
+            mel = spec_augment(mel, args)
 
+        pred_vad, pred_pitch, pred_technique, _ = model(mel)
+
+        effective_w_technique = _get_w_technique(epoch, args)
         total, vad_l, pitch_l, tech_l = compute_loss(
             pred_vad, pred_pitch, pred_technique,
             vad, f0, technique, has_technique,
             args, device,
+            w_technique_override=effective_w_technique,
         )
 
         optimizer.zero_grad()
@@ -422,12 +642,13 @@ def train_one_epoch(model, loader, optimizer, scheduler, writer,
 
     if n_batches == 0:
         warnings.warn("No batches processed this epoch.", RuntimeWarning)
-        return float("nan")
+        return float("nan"), {'vad': float('nan'), 'pitch': float('nan'), 'technique': float('nan')}
 
-    for k, v in running.items():
-        writer.add_scalar(f"train/{k}", v / n_batches, epoch)
+    avgs = {k: v / n_batches for k, v in running.items()}
+    for k, v in avgs.items():
+        writer.add_scalar(f"train/{k}", v, epoch)
     writer.add_scalar("train/lr", optimizer.param_groups[0]['lr'], epoch)
-    return running['total'] / n_batches
+    return avgs['total'], avgs
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -441,8 +662,8 @@ def evaluate(model, data_dir, technique_dir, writer, epoch, device, args):
     results = {}
 
     # ── Pitch / VAD evaluation ───────────────────────────────────────────
-    test_path = os.path.join(data_dir, "test.npz")
-    if os.path.exists(test_path):
+    test_path = os.path.join(data_dir, "test.npz") if data_dir else None
+    if test_path and os.path.exists(test_path):
         test = np.load(test_path)
         clips   = test['clips']   # (N, T, 40)
         f0_all  = test['f0']      # (N, T)
@@ -452,7 +673,7 @@ def evaluate(model, data_dir, technique_dir, writer, epoch, device, args):
         clip_results = []
         for i in range(N):
             mel = torch.from_numpy(clips[i].astype(np.float32)).unsqueeze(0).to(device)
-            v, p, _ = model(mel)
+            v, p, _, _ = model(mel)
             pv = v.squeeze().cpu().numpy()
             pp = p.squeeze(0).cpu().numpy()
             T  = pv.shape[0]
@@ -501,38 +722,43 @@ def evaluate(model, data_dir, technique_dir, writer, epoch, device, args):
         print(f"  Macro RPA: {macro_rpa:.4f}")
 
     # ── Technique F1 evaluation ──────────────────────────────────────────
-    tech_path = technique_dir and os.path.join(technique_dir, "technique.npz")
+    tech_path = technique_dir and os.path.join(technique_dir, "technique_test.npz")
     if tech_path and os.path.exists(tech_path):
-        data = np.load(tech_path)
-        mel_all  = data["mel"].astype(np.float32)     # (N, T, 40)
-        tech_all = data["technique"].astype(np.float32)  # (N, N_TECH) or (N, T, N_TECH)
+        data     = np.load(tech_path, allow_pickle=True)
+        mel_flat = data["mel"].astype(np.float32)       # (total_frames, 40)
+        tech_all = data["technique"].astype(np.float32) # (n_clips, N_TECH)
+        lengths  = data["lengths"].astype(np.int32)     # (n_clips,)
 
+        # Split flat mel back into per-clip tensors
         all_pred, all_true = [], []
-        for i in range(len(mel_all)):
-            mel_t = torch.from_numpy(mel_all[i]).unsqueeze(0).to(device)
-            _, _, pred_tech = model(mel_t)
+        offset = 0
+        for clip_idx, clip_len in enumerate(lengths):
+            clip_mel = mel_flat[offset:offset + clip_len]   # (T, 40)
+            offset  += clip_len
+            if clip_len == 0:
+                continue
+            mel_t = torch.from_numpy(clip_mel).unsqueeze(0).to(device)  # (1,T,40)
+            with torch.no_grad():
+                _, _, pred_tech, _ = model(mel_t)
             # Average over time for clip-level prediction
             pred_clip = pred_tech.squeeze(0).mean(0).cpu().numpy()   # (N_TECH,)
             all_pred.append(pred_clip)
-
-            if tech_all.ndim == 2:
-                all_true.append(tech_all[i])                          # (N_TECH,)
-            else:
-                all_true.append(tech_all[i].max(0))                   # (T, N_TECH) → (N_TECH,)
+            all_true.append(tech_all[clip_idx])                       # (N_TECH,)
 
         all_pred = np.stack(all_pred)   # (N, N_TECH)
         all_true = np.stack(all_true)   # (N, N_TECH)
         pred_bin = (all_pred > 0.5).astype(int)
 
-        print(f"\n  {'Technique':<12}  {'F1':>6}  {'AP':>6}")
-        print(f"  {'─'*12}  {'─'*6}  {'─'*6}")
+        print(f"\n  {'Technique':<12}  {'Prec':>6}  {'Recall':>6}  {'F1':>6}  {'AP':>6}")
+        print(f"  {'─'*12}  {'─'*6}  {'─'*6}  {'─'*6}  {'─'*6}")
         f1s, aps = [], []
         for k, name in enumerate(TECHNIQUE_NAMES):
             if all_true[:, k].sum() == 0:
                 continue
-            f1 = f1_score(all_true[:, k], pred_bin[:, k], zero_division=0)
+            p, r, f1, _ = precision_recall_fscore_support(
+                all_true[:, k], pred_bin[:, k], average='binary', zero_division=0)
             ap = average_precision_score(all_true[:, k], all_pred[:, k])
-            print(f"  {name:<12}  {f1:6.3f}  {ap:6.3f}")
+            print(f"  {name:<12}  {p:6.3f}  {r:6.3f}  {f1:6.3f}  {ap:6.3f}")
             f1s.append(f1)
             aps.append(ap)
             writer.add_scalar(f"eval/f1_{name}", f1, epoch)
@@ -570,8 +796,9 @@ def main():
         device = torch.device(args.device)
     print(f"Device: {device}  |  Arch: {args.arch}  |  causal={args.causal}")
 
-    data_dir     = os.path.abspath(args.data_dir)
-    tech_dir     = os.path.abspath(args.technique_dir) if args.technique_dir else None
+    data_dir     = os.path.abspath(args.data_dir) if args.data_dir else None
+    tech_dirs    = [os.path.abspath(d) for d in args.technique_dirs] \
+                   if args.technique_dirs else []
     output_dir   = os.path.abspath(args.output_dir)
     ckpt_dir     = os.path.join(output_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -596,8 +823,21 @@ def main():
 
     model.to(device)
 
+    # Noise pool (loaded once; drawn per-batch in training loop)
+    noise_pool = None
+    if args.augment != "none":
+        noise_dir = (os.path.abspath(args.noise_dir) if args.noise_dir
+                     else data_dir)
+        if noise_dir is None:
+            raise RuntimeError(
+                "--augment requires noise.npz: pass --noise-dir or --data-dir")
+        noise_pool = NoisePool(noise_dir, args.seq_len)
+    print(f"Augmentation: {args.augment}"
+          + (f"  SNR=[{args.snr_range[0]},{args.snr_range[1]}] dB"
+             f"  p_clean={args.p_clean}" if args.augment != "none" else ""))
+
     # Data
-    loader = make_joint_loader(data_dir, tech_dir, args.seq_len,
+    loader = make_joint_loader(data_dir, tech_dirs, args.seq_len,
                                args.batch_size, args.num_workers)
 
     # Optimizer + scheduler
@@ -636,9 +876,10 @@ def main():
 
     for epoch in range(start_epoch, start_epoch + args.epochs):
         t0 = time.time()
-        train_loss = train_one_epoch(
+        train_loss, train_losses = train_one_epoch(
             model, loader, optimizer, scheduler, writer,
-            epoch, device, args, global_step_offset=global_step,
+            epoch, device, args, noise_pool=noise_pool,
+            global_step_offset=global_step,
         )
         global_step += len(loader)
 
@@ -646,7 +887,10 @@ def main():
             scheduler.step()
 
         dt = time.time() - t0
-        print(f"  Epoch {epoch} — {dt:.1f}s — loss={train_loss:.5f}")
+        print(f"  Epoch {epoch} — {dt:.1f}s — loss={train_loss:.5f}"
+              f"  (vad={train_losses['vad']:.4f}"
+              f"  pitch={train_losses['pitch']:.4f}"
+              f"  tech={train_losses['technique']:.4f})")
 
         # Checkpoint every epoch
         ckpt = {
@@ -668,7 +912,7 @@ def main():
 
         # Evaluation
         if epoch % args.eval_every == 0 or epoch == start_epoch:
-            eval_res = evaluate(model, data_dir, tech_dir,
+            eval_res = evaluate(model, data_dir, tech_dirs[0] if tech_dirs else None,
                                 writer, epoch, device, args)
             if eval_res:
                 # Prefer macro F1 as primary metric (technique is the goal);

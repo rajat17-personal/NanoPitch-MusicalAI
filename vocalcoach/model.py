@@ -341,11 +341,13 @@ class VocalCoachTCN(nn.Module):
     """
 
     def __init__(self, n_mels=N_MELS, hidden=128, n_blocks=8, kernel_size=3,
-                 causal=True, dropout=0.1, n_techniques=N_TECHNIQUES):
+                 causal=True, dropout=0.1, n_techniques=N_TECHNIQUES,
+                 quality_head=False):
         super().__init__()
         self.causal  = causal
         self.hidden  = hidden
         self.n_blocks = n_blocks
+        self.has_quality = quality_head
 
         # Project mel bands into the hidden dimension (1×1 conv = linear per frame)
         self.input_proj = nn.Conv1d(n_mels, hidden, kernel_size=1)
@@ -360,17 +362,27 @@ class VocalCoachTCN(nn.Module):
         self.norm = nn.LayerNorm(hidden)
 
         # ── Output heads (multi-task) ──
-        # All three share the same backbone features. Sigmoid outputs give
-        # per-class probabilities in [0,1] — appropriate for both binary
-        # (VAD) and multi-label (technique) classification.
         self.head_vad       = nn.Linear(hidden, 1)
         self.head_pitch     = nn.Linear(hidden, PITCH_BINS)
         self.head_technique = nn.Linear(hidden, n_techniques)
 
+        # ── Optional SingMOS-Pro-style quality head ──
+        # Clip-level MOS prediction via mean-pooled backbone + 2-layer MLP.
+        # Output is in [0,1]; scale to MOS [1,5] at interpretation time.
+        # Enable with quality_head=True; requires quality labels in training data.
+        if quality_head:
+            self.head_quality = nn.Sequential(
+                nn.Linear(hidden, hidden // 4),
+                nn.GELU(),
+                nn.Linear(hidden // 4, 1),
+                nn.Sigmoid(),
+            )
+
         self._init_weights()
         n = sum(p.numel() for p in self.parameters())
         print(f"VocalCoachTCN: {n:,} parameters "
-              f"(hidden={hidden}, blocks={n_blocks}, causal={causal})")
+              f"(hidden={hidden}, blocks={n_blocks}, causal={causal}"
+              f"{', quality_head=on' if quality_head else ''})")
 
     def _init_weights(self):
         for m in self.modules():
@@ -389,6 +401,7 @@ class VocalCoachTCN(nn.Module):
             vad:       (B, T, 1)   — voice activity probability
             pitch:     (B, T, 360) — pitch posteriorgram
             technique: (B, T, N)   — per-technique probability (multi-label)
+            quality:   (B, 1)      — clip-level MOS score in [0,1], or None
         """
         x = mel.permute(0, 2, 1)           # (B, 40, T)
         x = F.gelu(self.input_proj(x))     # (B, hidden, T)
@@ -401,8 +414,9 @@ class VocalCoachTCN(nn.Module):
         vad       = torch.sigmoid(self.head_vad(x))        # (B, T, 1)
         pitch     = torch.sigmoid(self.head_pitch(x))      # (B, T, 360)
         technique = torch.sigmoid(self.head_technique(x))  # (B, T, N)
+        quality   = self.head_quality(x.mean(dim=1)) if self.has_quality else None
 
-        return vad, pitch, technique
+        return vad, pitch, technique, quality
 
     def receptive_field_ms(self, hop_ms=10):
         """Temporal receptive field of the TCN stack in milliseconds."""
@@ -577,13 +591,14 @@ class VocalCoachConformer(nn.Module):
 
     def __init__(self, n_mels=N_MELS, hidden=64, n_layers=4, n_heads=4,
                  ff_expansion=4, conv_kernel=31, dropout=0.1,
-                 causal=False, n_techniques=N_TECHNIQUES):
+                 causal=False, n_techniques=N_TECHNIQUES, quality_head=False):
         super().__init__()
         assert hidden % n_heads == 0, (
             f"hidden ({hidden}) must be divisible by n_heads ({n_heads})")
 
         self.hidden = hidden
         self.causal = causal
+        self.has_quality = quality_head
 
         # Linear projection from mel bands into the model dimension.
         # Unlike TCN which uses Conv1d(k=1), here a simple Linear suffices
@@ -602,10 +617,18 @@ class VocalCoachConformer(nn.Module):
         self.head_pitch     = nn.Linear(hidden, PITCH_BINS)
         self.head_technique = nn.Linear(hidden, n_techniques)
 
+        if quality_head:
+            self.head_quality = nn.Sequential(
+                nn.Linear(hidden, hidden // 4),
+                nn.GELU(),
+                nn.Linear(hidden // 4, 1),
+                nn.Sigmoid(),
+            )
+
         n = sum(p.numel() for p in self.parameters())
         print(f"VocalCoachConformer: {n:,} parameters "
               f"(hidden={hidden}, layers={n_layers}, heads={n_heads}, "
-              f"causal={causal})")
+              f"causal={causal}{', quality_head=on' if quality_head else ''})")
 
     def forward(self, mel):
         """Run the model on a batch of mel spectrograms.
@@ -617,6 +640,7 @@ class VocalCoachConformer(nn.Module):
             vad:       (B, T, 1)   — voice activity probability
             pitch:     (B, T, 360) — pitch posteriorgram
             technique: (B, T, N)   — per-technique probability (multi-label)
+            quality:   (B, 1)      — clip-level MOS score in [0,1], or None
         """
         x = self.input_proj(mel)    # (B, T, hidden)
 
@@ -627,8 +651,9 @@ class VocalCoachConformer(nn.Module):
         vad       = torch.sigmoid(self.head_vad(x))
         pitch     = torch.sigmoid(self.head_pitch(x))
         technique = torch.sigmoid(self.head_technique(x))
+        quality   = self.head_quality(x.mean(dim=1)) if self.has_quality else None
 
-        return vad, pitch, technique
+        return vad, pitch, technique, quality
 
 
 # ═══════════════════════════════════════════════════════════════════════
