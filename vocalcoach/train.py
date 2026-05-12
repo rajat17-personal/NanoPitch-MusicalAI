@@ -704,8 +704,14 @@ def train_one_epoch(model, loader, optimizer, scheduler, writer,
 # ═══════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def evaluate(model, data_dir, technique_dir, writer, epoch, device, args):
-    """Evaluate pitch RPA (from test.npz) and technique F1 (from technique.npz)."""
+def evaluate(model, data_dir, technique_dirs, writer, epoch, device, args):
+    """Evaluate pitch RPA (from test.npz) and technique F1 (from technique*.npz).
+
+    technique_dirs: list of directories (or None/empty). All test files found
+    across all dirs are merged so multi-dataset runs evaluate all classes.
+    """
+    if isinstance(technique_dirs, str):
+        technique_dirs = [technique_dirs]  # back-compat
     model.eval()
     results = {}
 
@@ -770,18 +776,27 @@ def evaluate(model, data_dir, technique_dir, writer, epoch, device, args):
         print(f"  Macro RPA: {macro_rpa:.4f}")
 
     # ── Technique F1 evaluation ──────────────────────────────────────────
-    tech_path = None
-    if technique_dir:
+    # Collect test files from all technique dirs and merge them so that
+    # multi-dataset runs (VocalSet + GTSinger) evaluate all classes together.
+    tech_files = []
+    for tdir in (technique_dirs or []):
         for _fname in ("technique_test.npz", "technique_gtsinger_test.npz"):
-            _p = os.path.join(technique_dir, _fname)
+            _p = os.path.join(tdir, _fname)
             if os.path.exists(_p):
-                tech_path = _p
+                tech_files.append(_p)
                 break
-    if tech_path:
-        data     = np.load(tech_path, allow_pickle=True)
-        mel_flat = data["mel"].astype(np.float32)       # (total_frames, 40)
-        tech_all = data["technique"].astype(np.float32) # (n_clips, N_TECH)
-        lengths  = data["lengths"].astype(np.int32)     # (n_clips,)
+
+    if tech_files:
+        mel_parts, tech_parts, len_parts = [], [], []
+        for tf in tech_files:
+            d = np.load(tf, allow_pickle=True)
+            mel_parts.append(d["mel"].astype(np.float32))
+            tech_parts.append(d["technique"].astype(np.float32))
+            len_parts.append(d["lengths"].astype(np.int32))
+        mel_flat = np.concatenate(mel_parts, axis=0)
+        tech_all = np.concatenate(tech_parts, axis=0)
+        lengths  = np.concatenate(len_parts,  axis=0)
+        print(f"  Technique eval: {len(tech_files)} file(s), {len(lengths)} clips")
 
         # Split flat mel back into per-clip tensors
         all_pred, all_true = [], []
@@ -993,7 +1008,7 @@ def main():
 
         # Evaluation
         if epoch % args.eval_every == 0 or epoch == start_epoch:
-            eval_res = evaluate(model, data_dir, tech_dirs[0] if tech_dirs else None,
+            eval_res = evaluate(model, data_dir, tech_dirs,
                                 writer, epoch, device, args)
             if eval_res:
                 # Prefer macro F1 as primary metric (technique is the goal);
