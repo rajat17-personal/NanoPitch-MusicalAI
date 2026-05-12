@@ -70,6 +70,7 @@ Usage
 import argparse
 import os
 import sys
+from pathlib import Path
 
 import librosa
 import numpy as np
@@ -179,7 +180,8 @@ def parse_args():
                    help="directory for output NPZ files")
     p.add_argument("--local-dir", default=None,
                    help="path to a locally downloaded GTSinger dataset "
-                        "(skips HuggingFace download)")
+                        "(HuggingFace serialized DatasetDict — skips HuggingFace download). "
+                        "For raw WAV folders use --audio-dir instead.")
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     p.add_argument("--rmvpe-model", default="rmvpe.pt")
     p.add_argument("--train-split", default="train",
@@ -431,6 +433,125 @@ def extract_split(dataset, rmvpe, device, min_frames, max_per_tech, split_name,
             technique_labels, lengths, clip_ids, total_skipped)
 
 
+# ── Filesystem walker (raw WAV folder, no HF dataset needed) ─────────
+
+# Folder name → technique index mapping for GTSinger's group structure:
+#   language/singer/TechniqueName/song/TechniqueName_Group/*.wav
+_FOLDER_TO_TECH = {
+    "vibrato_group":           0,   # vibrato
+    "breathy_group":           1,   # breathy
+    "mixed_voice_and_falsetto": 2,  # falsetto (technique folder level)
+    "falsetto_group":          2,   # falsetto (group folder level)
+    "mixed_voice_group":       2,   # falsetto variant
+    # Glissando, Pharyngeal, Control_Group, Paired_Speech_Group → skipped
+}
+
+
+def extract_from_wav_dir(audio_dir, rmvpe, device, min_frames, max_per_tech,
+                         test_singers=None):
+    """Walk a raw GTSinger WAV directory and extract technique clips.
+
+    Expected layout:
+        audio_dir/
+          <language>/
+            <singer>/
+              <TechniqueFolder>/    e.g. Vibrato, Breathy, Mixed_Voice_and_Falsetto
+                <song>/
+                  <Group>/          e.g. Vibrato_Group, Control_Group
+                    0000.wav ...
+
+    The technique label comes from the Group folder name
+    (Vibrato_Group → vibrato, Falsetto_Group / Mixed_Voice_Group → falsetto,
+    Breathy_Group → breathy). Control_Group and Paired_Speech_Group are skipped.
+
+    test_singers: set of singer names held out for the test split (e.g. {'EN-Alto-1'}).
+                  If None all clips go to train.
+    Returns two result tuples (train, test), each matching the extract_split
+    return format.
+    """
+    train_res = [[], [], [], [], [], []]
+    test_res  = [[], [], [], [], [], []]
+    train_skip = test_skip = 0
+
+    counts_tr = {i: 0 for i in range(len(TECHNIQUE_NAMES))}
+    counts_te = {i: 0 for i in range(len(TECHNIQUE_NAMES))}
+    skip_reasons = {"no_technique": 0, "audio_short": 0, "frame_short": 0}
+
+    wav_paths = sorted(
+        p for p in Path(audio_dir).rglob("*.wav")
+    )
+    print(f"  Found {len(wav_paths):,} WAV files under {audio_dir}")
+
+    for wav_path in tqdm(wav_paths, desc="  walking"):
+        parts = wav_path.parts
+        # Expect at least: audio_dir / language / singer / technique_dir / song / group / file
+        if len(parts) < 6:
+            continue
+
+        group_name  = parts[-2].lower()   # e.g. "vibrato_group"
+        singer_name = parts[-5]           # e.g. "EN-Alto-1"
+
+        tech_idx = _FOLDER_TO_TECH.get(group_name)
+        if tech_idx is None:
+            skip_reasons["no_technique"] += 1
+            continue
+
+        is_test = test_singers and singer_name in test_singers
+        counts  = counts_te if is_test else counts_tr
+        res     = test_res  if is_test else train_res
+
+        if max_per_tech and counts[tech_idx] >= max_per_tech:
+            continue
+
+        try:
+            audio_arr, orig_sr = librosa.load(str(wav_path), sr=None, mono=True)
+        except Exception:
+            skip_reasons["audio_short"] += 1
+            continue
+
+        y = resample_to_16k(np.asarray(audio_arr), orig_sr)
+        if len(y) < min_frames * HOP_LENGTH:
+            skip_reasons["audio_short"] += 1
+            continue
+
+        log_mel = extract_mel(y)
+        f0_hz   = rmvpe.infer_from_audio(y, sample_rate=SR, device=device).astype(np.float32)
+        T       = min(len(log_mel), len(f0_hz))
+        if T < min_frames:
+            skip_reasons["frame_short"] += 1
+            continue
+
+        log_mel   = log_mel[:T]
+        f0_hz     = f0_hz[:T]
+        frame_vad = extract_vad(y, T)
+
+        label = np.zeros(len(TECHNIQUE_NAMES), dtype=np.float32)
+        label[tech_idx] = 1.0
+
+        res[0].append(log_mel)
+        res[1].append(f0_hz)
+        res[2].append(frame_vad)
+        res[3].append(label)
+        res[4].append(T)
+        res[5].append(str(wav_path.relative_to(audio_dir)))
+        counts[tech_idx] += 1
+
+    total_skip = sum(skip_reasons.values())
+    for label_str, counts in [("train", counts_tr), ("test", counts_te)]:
+        print(f"\n  {label_str} — extracted per technique:")
+        for i, name in enumerate(TECHNIQUE_NAMES):
+            print(f"    {name:<12}: {counts[i]:4d} clips")
+    print(f"  Skipped total: {total_skip}")
+    for reason, n in skip_reasons.items():
+        if n:
+            print(f"    {reason:<16}: {n}")
+
+    return (
+        (*train_res, train_skip),
+        (*test_res,  test_skip),
+    )
+
+
 # ── Save ─────────────────────────────────────────────────────────────
 
 def save_split(output_path, mel_chunks, f0_chunks, vad_chunks,
@@ -476,36 +597,51 @@ def main():
     print(f"Loading RMVPE from {args.rmvpe_model} ...")
     rmvpe = RMVPE(args.rmvpe_model, hop_length=HOP_LENGTH)
 
-    train_ds, test_ds = load_gtsinger(
-        args.local_dir, args.train_split, args.test_split,
-        streaming=not args.no_streaming, hf_name=args.hf_name)
-
     os.makedirs(args.output_dir, exist_ok=True)
 
-    mapped = ['vibrato', 'breathy', 'falsetto']
-    print(f"\nExtracting training split (mapped via *_tech fields: {mapped}) ...")
-    tr = extract_split(train_ds, rmvpe, args.device, min_frames,
-                       args.max_per_technique, "train", audio_dir=args.audio_dir)
-    save_split(os.path.join(args.output_dir, "technique_gtsinger_train.npz"),
-               *tr[:-1])
-
-    if test_ds is not None:
-        print("\nExtracting test split ...")
-        te = extract_split(test_ds, rmvpe, args.device, min_frames,
-                           args.max_per_technique, "test", audio_dir=args.audio_dir)
+    if args.audio_dir and not args.local_dir:
+        # Raw WAV folder — walk filesystem directly, no HF dataset needed.
+        # Test singers held out: one per language to match VocalSet split style.
+        # One small singer per language group held out for test.
+        # Chosen to be the smallest singer by clip count to keep train ~80%.
+        # EN-Alto-1 (1792), KO-Soprano-1 (377), IT-Soprano-1 (550),
+        # JA-Tenor-1 (910), ES-Soprano-1 (1665) → ~5% each, ~20% total.
+        test_singers = {"EN-Alto-1", "KO-Soprano-1", "IT-Soprano-1",
+                        "JA-Tenor-1", "ES-Soprano-1"}
+        print(f"\nExtracting from WAV directory: {args.audio_dir}")
+        print(f"  Test singers ({len(test_singers)}): {sorted(test_singers)}")
+        tr, te = extract_from_wav_dir(
+            args.audio_dir, rmvpe, args.device, min_frames,
+            args.max_per_technique, test_singers=test_singers)
+        save_split(os.path.join(args.output_dir, "technique_gtsinger_train.npz"),
+                   *tr[:-1])
         save_split(os.path.join(args.output_dir, "technique_gtsinger_test.npz"),
                    *te[:-1])
+    else:
+        # HuggingFace dataset path (streaming or cached Arrow file).
+        train_ds, test_ds = load_gtsinger(
+            args.local_dir, args.train_split, args.test_split,
+            streaming=not args.no_streaming, hf_name=args.hf_name)
 
-    print(f"\nDone. Technique fields used from AaronZ345/GTSinger:")
-    print(f"  vibrato_tech  → label[0] vibrato")
-    print(f"  breathy_tech  → label[1] breathy")
-    print(f"  falsetto_tech → label[2] falsetto")
-    print(f"  (mix_tech / pharyngeal_tech / glissando_tech → skipped)")
-    print(f"\nTo use in training, pass both VocalSet and GTSinger dirs:")
-    print(f"  python vocalcoach/train.py \\")
-    print(f"      --technique-dir data/vocalset \\  # for vibrato/breathy/belt/straight")
-    print(f"      # Re-run with --technique-dir data/gtsinger_technique to add falsetto")
-    print(f"  (ConcatDataset merging across both dirs is a future enhancement)")
+        mapped = ['vibrato', 'breathy', 'falsetto']
+        print(f"\nExtracting training split (mapped via *_tech fields: {mapped}) ...")
+        tr = extract_split(train_ds, rmvpe, args.device, min_frames,
+                           args.max_per_technique, "train", audio_dir=args.audio_dir)
+        save_split(os.path.join(args.output_dir, "technique_gtsinger_train.npz"),
+                   *tr[:-1])
+
+        if test_ds is not None:
+            print("\nExtracting test split ...")
+            te = extract_split(test_ds, rmvpe, args.device, min_frames,
+                               args.max_per_technique, "test", audio_dir=args.audio_dir)
+            save_split(os.path.join(args.output_dir, "technique_gtsinger_test.npz"),
+                       *te[:-1])
+
+    print(f"\nDone. Output in {args.output_dir}/")
+    print(f"  technique_gtsinger_train.npz — training clips")
+    print(f"  technique_gtsinger_test.npz  — held-out test clips")
+    print(f"\nTo include in probe-mode training:")
+    print(f"  --technique-dirs data/vocalset data/gtsinger_technique")
 
 
 if __name__ == "__main__":

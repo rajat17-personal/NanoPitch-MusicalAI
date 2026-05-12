@@ -864,8 +864,13 @@ def main():
             "checkpoints from trusted sources.", RuntimeWarning)
         resume_ckpt = torch.load(args.resume, map_location="cpu",
                                  weights_only=False)
-        model.load_state_dict(resume_ckpt["state_dict"])
+        missing, unexpected = model.load_state_dict(
+            resume_ckpt["state_dict"], strict=False)
         start_epoch = resume_ckpt.get("epoch", 0) + 1
+        if missing:
+            print(f"  Checkpoint missing keys (will init from scratch): {missing}")
+        if unexpected:
+            print(f"  Checkpoint unexpected keys (ignored): {unexpected}")
         print(f"Resumed from epoch {start_epoch - 1}")
 
     model.to(device)
