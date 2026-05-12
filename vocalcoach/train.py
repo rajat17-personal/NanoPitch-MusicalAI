@@ -167,6 +167,13 @@ parser.add_argument("--technique-pos-weights", type=float, nargs=5,
                          "  VocalSet + GTSinger (default):      2.9  4.2  1.0  4.0  1.9\n"
                          "  (inf = class absent; set to 1.0 to ignore that class)")
 
+# Backbone freeze (Option B — stop technique gradients reaching backbone)
+parser.add_argument("--freeze-backbone-epochs", type=int, default=0,
+                    help="freeze backbone weights for this many epochs after resuming, "
+                         "so only the technique head trains. Backbone unfreezes after N epochs "
+                         "for joint fine-tuning. Use with --resume from a pitch-only checkpoint. "
+                         "Rule of thumb: 20-30 epochs of frozen technique head, then unfreeze.")
+
 # Curriculum training (Option 3 — phase loss weights)
 parser.add_argument("--curriculum", action="store_true",
                     help="Enable curriculum training: technique loss weight is zeroed "
@@ -580,6 +587,23 @@ def _get_w_technique(epoch, args):
     return args.w_technique * ramp_progress / args.curriculum_ramp
 
 
+def _set_backbone_frozen(model, frozen: bool):
+    """Freeze or unfreeze backbone weights (everything except the three output heads).
+
+    Technique gradients flow only through head_technique when frozen=True,
+    preventing them from eroding the pitch representations built in stage 1.
+    The VAD and pitch heads remain trainable so they can continue to refine.
+    """
+    head_names = {"head_vad", "head_pitch", "head_technique"}
+    for name, param in model.named_parameters():
+        top = name.split(".")[0]
+        if top not in head_names:
+            param.requires_grad = not frozen
+    state = "FROZEN" if frozen else "unfrozen"
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Backbone {state} — {trainable:,} trainable parameters")
+
+
 def train_one_epoch(model, loader, optimizer, scheduler, writer,
                     epoch, device, args, noise_pool=None,
                     global_step_offset=0):
@@ -874,7 +898,17 @@ def main():
     patience_count = 0
     global_step    = 0
 
+    freeze_until = start_epoch + args.freeze_backbone_epochs
+    if args.freeze_backbone_epochs > 0:
+        _set_backbone_frozen(model, frozen=True)
+        print(f"  Backbone frozen for epochs {start_epoch}–{freeze_until - 1}, "
+              f"unfreezes at epoch {freeze_until}")
+
     for epoch in range(start_epoch, start_epoch + args.epochs):
+        if args.freeze_backbone_epochs > 0 and epoch == freeze_until:
+            _set_backbone_frozen(model, frozen=False)
+            print(f"  Epoch {epoch}: backbone unfrozen — joint fine-tuning begins")
+
         t0 = time.time()
         train_loss, train_losses = train_one_epoch(
             model, loader, optimizer, scheduler, writer,
