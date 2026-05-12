@@ -121,6 +121,10 @@ parser.add_argument("--hidden", type=int, default=None,
 parser.add_argument("--n-blocks", type=int, default=None,
                     help="number of TCN blocks or Conformer layers "
                          "(default: 8 for TCN, 4 for Conformer)")
+parser.add_argument("--deep-technique-head", action="store_true",
+                    help="replace the single Linear technique head with a 2-layer MLP "
+                         "(Linear→GELU→Dropout→Linear). Recommended with --probe-mode "
+                         "where the backbone is frozen and the head must do more work.")
 
 # Device
 parser.add_argument("--device", type=str, default="cuda",
@@ -849,6 +853,7 @@ def main():
     model_kwargs = dict(causal=args.causal)
     if args.hidden   is not None: model_kwargs['hidden']   = args.hidden
     if args.n_blocks is not None: model_kwargs['n_blocks'] = args.n_blocks
+    if args.deep_technique_head:  model_kwargs['deep_technique_head'] = True
     model = build_model(args.arch, **model_kwargs)
 
     start_epoch = 1

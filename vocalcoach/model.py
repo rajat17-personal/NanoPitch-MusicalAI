@@ -342,7 +342,7 @@ class VocalCoachTCN(nn.Module):
 
     def __init__(self, n_mels=N_MELS, hidden=128, n_blocks=8, kernel_size=3,
                  causal=True, dropout=0.1, n_techniques=N_TECHNIQUES,
-                 quality_head=False):
+                 quality_head=False, deep_technique_head=False):
         super().__init__()
         self.causal  = causal
         self.hidden  = hidden
@@ -362,9 +362,19 @@ class VocalCoachTCN(nn.Module):
         self.norm = nn.LayerNorm(hidden)
 
         # ── Output heads (multi-task) ──
-        self.head_vad       = nn.Linear(hidden, 1)
-        self.head_pitch     = nn.Linear(hidden, PITCH_BINS)
-        self.head_technique = nn.Linear(hidden, n_techniques)
+        self.head_vad   = nn.Linear(hidden, 1)
+        self.head_pitch = nn.Linear(hidden, PITCH_BINS)
+        # Technique head: single Linear (default) or 2-layer MLP for probe-mode
+        # where the backbone is frozen and the head must do more heavy lifting.
+        if deep_technique_head:
+            self.head_technique = nn.Sequential(
+                nn.Linear(hidden, hidden // 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden // 2, n_techniques),
+            )
+        else:
+            self.head_technique = nn.Linear(hidden, n_techniques)
 
         # ── Optional SingMOS-Pro-style quality head ──
         # Clip-level MOS prediction via mean-pooled backbone + 2-layer MLP.
@@ -591,7 +601,8 @@ class VocalCoachConformer(nn.Module):
 
     def __init__(self, n_mels=N_MELS, hidden=64, n_layers=4, n_heads=4,
                  ff_expansion=4, conv_kernel=31, dropout=0.1,
-                 causal=False, n_techniques=N_TECHNIQUES, quality_head=False):
+                 causal=False, n_techniques=N_TECHNIQUES, quality_head=False,
+                 deep_technique_head=False):
         super().__init__()
         assert hidden % n_heads == 0, (
             f"hidden ({hidden}) must be divisible by n_heads ({n_heads})")
@@ -613,9 +624,17 @@ class VocalCoachConformer(nn.Module):
         self.norm = nn.LayerNorm(hidden)
 
         # ── Output heads (multi-task, same as TCN) ──
-        self.head_vad       = nn.Linear(hidden, 1)
-        self.head_pitch     = nn.Linear(hidden, PITCH_BINS)
-        self.head_technique = nn.Linear(hidden, n_techniques)
+        self.head_vad   = nn.Linear(hidden, 1)
+        self.head_pitch = nn.Linear(hidden, PITCH_BINS)
+        if deep_technique_head:
+            self.head_technique = nn.Sequential(
+                nn.Linear(hidden, hidden // 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden // 2, n_techniques),
+            )
+        else:
+            self.head_technique = nn.Linear(hidden, n_techniques)
 
         if quality_head:
             self.head_quality = nn.Sequential(

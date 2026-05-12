@@ -284,103 +284,142 @@ def load_gtsinger(local_dir, train_split, test_split, streaming, hf_name):
 
 # ── Per-split extraction ──────────────────────────────────────────────
 
+def _load_audio(example, audio_dir):
+    """Load audio array from a GTSinger example dict. Returns (arr, sr) or (None, None)."""
+    import io
+    audio_data = example.get("audio")
+    if isinstance(audio_data, dict):
+        raw_bytes = audio_data.get("bytes")
+        raw_path  = audio_data.get("path")
+        try:
+            if raw_bytes:
+                return librosa.load(io.BytesIO(raw_bytes), sr=None, mono=True)
+            elif raw_path:
+                return librosa.load(raw_path, sr=None, mono=True)
+        except Exception:
+            pass
+
+    wav_fn = example.get("wav_fn")
+    if wav_fn:
+        local_path = os.path.join(audio_dir, wav_fn) if audio_dir else None
+        try:
+            if local_path and os.path.exists(local_path):
+                return librosa.load(local_path, sr=None, mono=True)
+            from huggingface_hub import hf_hub_download
+            cached = hf_hub_download(repo_id=HF_REPO_ID, filename=wav_fn,
+                                     repo_type="dataset",
+                                     token=os.environ.get("HF_TOKEN") or True)
+            return librosa.load(cached, sr=None, mono=True)
+        except Exception:
+            pass
+    return None, None
+
+
 def extract_split(dataset, rmvpe, device, min_frames, max_per_tech, split_name,
                   audio_dir=None):
-    """Iterate through a GTSinger dataset split and extract features.
+    """Iterate through GTSinger and emit one clip per active-technique note.
+
+    GTSinger provides per-note timestamps (note_start, note_end) and per-note
+    binary technique indicators (vibrato_tech, breathy_tech, falsetto_tech).
+    Instead of labelling the entire song phrase with any() over all notes
+    (which assigns technique=1 to frames where the technique is not active),
+    we extract each note window individually and label only that window.
+
+    This matches VocalSet's structure: short isolated clips with clean labels.
+    It also gives falsetto clips that VocalSet lacks entirely.
 
     Returns (mel_chunks, f0_chunks, vad_chunks, technique_labels,
              lengths, clip_ids, skipped_count)
     """
     mel_chunks, f0_chunks, vad_chunks = [], [], []
     technique_labels, lengths, clip_ids = [], [], []
-    counts = {i: 0 for i in range(len(TECHNIQUE_NAMES))}
+    counts  = {i: 0 for i in range(len(TECHNIQUE_NAMES))}
     skip_reasons = {"tech_unmapped": 0, "audio_bad": 0,
-                    "audio_short": 0, "frame_short": 0}
+                    "audio_short": 0, "frame_short": 0, "no_timestamps": 0}
+
+    # Per-note technique fields present in GTSinger
+    NOTE_TECH_FIELDS = [
+        ('vibrato_tech',  0),   # vibrato
+        ('breathy_tech',  1),   # breathy
+        ('falsetto_tech', 2),   # falsetto
+        # belt=3, straight=4 absent in GTSinger — provided by VocalSet
+    ]
 
     for idx, example in enumerate(tqdm(dataset, desc=f"  {split_name}")):
-        # Derive clip-level label from per-note binary technique fields.
-        # Each *_tech field is a list<int64> where 1 = technique active for that note.
-        label = np.zeros(len(TECHNIQUE_NAMES), dtype=np.float32)
-        if any(example.get('vibrato_tech') or []):   label[0] = 1.0  # vibrato
-        if any(example.get('breathy_tech') or []):   label[1] = 1.0  # breathy
-        if any(example.get('falsetto_tech') or []):  label[2] = 1.0  # falsetto
-        # label[3]=belt, label[4]=straight absent in GTSinger — supplied by VocalSet
+        note_starts = example.get('note_start') or []
+        note_ends   = example.get('note_end')   or []
 
-        if label.sum() == 0:
+        # Fall back to clip-level any() when note timestamps are absent
+        if not note_starts or len(note_starts) != len(note_ends):
+            skip_reasons["no_timestamps"] += 1
+            continue
+
+        n_notes = len(note_starts)
+
+        # Build per-note label matrix: (n_notes, N_TECHNIQUES)
+        note_labels = np.zeros((n_notes, len(TECHNIQUE_NAMES)), dtype=np.float32)
+        for field, tech_idx in NOTE_TECH_FIELDS:
+            tech_flags = example.get(field) or []
+            for ni, flag in enumerate(tech_flags[:n_notes]):
+                if flag:
+                    note_labels[ni, tech_idx] = 1.0
+
+        # Skip song entirely if no technique-active notes
+        if note_labels.sum() == 0:
             skip_reasons["tech_unmapped"] += 1
             continue
 
-        mapped = [i for i in range(len(TECHNIQUE_NAMES)) if label[i] > 0]
-        primary = mapped[0]
-        if max_per_tech and counts[primary] >= max_per_tech:
-            continue
-
-        # Audio: the JSON has audio=null; actual WAV files are in HF repo LFS.
-        # Use wav_fn to download from HF Hub (cached after first run).
-        audio_arr, orig_sr = None, SR
-        audio_data = example.get("audio")
-        if isinstance(audio_data, dict):
-            raw_bytes = audio_data.get("bytes")
-            raw_path  = audio_data.get("path")
-            try:
-                import io
-                if raw_bytes:
-                    audio_arr, orig_sr = librosa.load(io.BytesIO(raw_bytes), sr=None, mono=True)
-                elif raw_path:
-                    audio_arr, orig_sr = librosa.load(raw_path, sr=None, mono=True)
-            except Exception:
-                pass
-
-        if audio_arr is None:
-            wav_fn = example.get("wav_fn")
-            if wav_fn:
-                local_path = os.path.join(audio_dir, wav_fn) if audio_dir else None
-                try:
-                    if local_path and os.path.exists(local_path):
-                        audio_arr, orig_sr = librosa.load(local_path, sr=None, mono=True)
-                    else:
-                        from huggingface_hub import hf_hub_download
-                        hf_token = os.environ.get("HF_TOKEN") or True
-                        cached = hf_hub_download(repo_id=HF_REPO_ID, filename=wav_fn,
-                                                 repo_type="dataset", token=hf_token)
-                        audio_arr, orig_sr = librosa.load(cached, sr=None, mono=True)
-                except Exception:
-                    pass
-
+        # Load audio once per song — reused across all notes
+        audio_arr, orig_sr = _load_audio(example, audio_dir)
         if audio_arr is None or len(audio_arr) == 0:
             skip_reasons["audio_bad"] += 1
             continue
 
-        y = resample_to_16k(np.asarray(audio_arr), orig_sr)
-        if len(y) < min_frames * HOP_LENGTH:
-            skip_reasons["audio_short"] += 1
-            continue
+        y_full = resample_to_16k(np.asarray(audio_arr), orig_sr)
+        # Extract mel + F0 for the full clip once; slice per note below
+        log_mel_full = extract_mel(y_full)
+        f0_full      = rmvpe.infer_from_audio(
+            y_full, sample_rate=SR, device=device).astype(np.float32)
+        T_full = min(len(log_mel_full), len(f0_full))
+        log_mel_full = log_mel_full[:T_full]
+        f0_full      = f0_full[:T_full]
+        vad_full     = extract_vad(y_full, T_full)
 
-        log_mel = extract_mel(y)
-        f0_hz   = rmvpe.infer_from_audio(y, sample_rate=SR, device=device).astype(np.float32)
-        T       = min(len(log_mel), len(f0_hz))
-        if T < min_frames:
-            skip_reasons["frame_short"] += 1
-            continue
+        for ni in range(n_notes):
+            label = note_labels[ni]
+            if label.sum() == 0:
+                continue  # no technique active for this note
 
-        log_mel = log_mel[:T]
-        f0_hz   = f0_hz[:T]
-        frame_vad = extract_vad(y, T)
+            active = [i for i in range(len(TECHNIQUE_NAMES)) if label[i] > 0]
+            primary = active[0]
+            if max_per_tech and counts[primary] >= max_per_tech:
+                continue
 
-        label = np.zeros(len(TECHNIQUE_NAMES), dtype=np.float32)
-        for our_idx in mapped:
-            label[our_idx] = 1.0
+            # Convert note timestamps to frame indices
+            t_start = float(note_starts[ni])
+            t_end   = float(note_ends[ni])
+            f_start = int(t_start * SR / HOP_LENGTH)
+            f_end   = min(int(t_end * SR / HOP_LENGTH), T_full)
 
-        mel_chunks.append(log_mel)
-        f0_chunks.append(f0_hz)
-        vad_chunks.append(frame_vad)
-        technique_labels.append(label)
-        lengths.append(T)
-        clip_ids.append(str(idx))
-        counts[primary] += 1
+            if f_end - f_start < min_frames:
+                skip_reasons["frame_short"] += 1
+                continue
+
+            note_mel = log_mel_full[f_start:f_end]
+            note_f0  = f0_full[f_start:f_end]
+            note_vad = vad_full[f_start:f_end]
+            T_note   = len(note_mel)
+
+            mel_chunks.append(note_mel)
+            f0_chunks.append(note_f0)
+            vad_chunks.append(note_vad)
+            technique_labels.append(label)
+            lengths.append(T_note)
+            clip_ids.append(f"{idx}_n{ni}")
+            counts[primary] += 1
 
     total_skipped = sum(skip_reasons.values())
-    print(f"\n  Extracted per technique:")
+    print(f"\n  Extracted per technique (note-level clips):")
     for i, name in enumerate(TECHNIQUE_NAMES):
         print(f"    {name:<12}: {counts[i]:4d} clips")
     print(f"  Skipped total: {total_skipped}")

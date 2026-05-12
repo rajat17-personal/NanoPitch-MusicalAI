@@ -221,10 +221,17 @@ def print_pitch_table(results, label="Model"):
 
 @torch.no_grad()
 def eval_technique(model, technique_dir, device):
-    """Evaluate technique classification on technique_test.npz."""
+    """Evaluate technique classification on technique_test.npz.
+
+    Also accepts technique_gtsinger_test.npz (GTSinger held-out split) —
+    the script tries technique_test.npz first, then the GTSinger filename.
+    """
     path = os.path.join(technique_dir, "technique_test.npz")
     if not os.path.exists(path):
-        print(f"  [skip] {path} not found")
+        # GTSinger extraction saves under a different name
+        path = os.path.join(technique_dir, "technique_gtsinger_test.npz")
+    if not os.path.exists(path):
+        print(f"  [skip] no technique_test.npz or technique_gtsinger_test.npz in {technique_dir}")
         return {}
 
     data     = np.load(path, allow_pickle=False)
