@@ -382,11 +382,13 @@ def make_joint_loader(pitch_vad_dir, technique_dirs, seq_len, batch_size,
 
     tech_datasets = []
     for tech_dir in (technique_dirs or []):
-        tech_path = os.path.join(tech_dir, "technique_train.npz")
-        if os.path.exists(tech_path):
-            tech_datasets.append(
-                TechniqueDataset(tech_dir, seq_len, filename="technique_train.npz")
-            )
+        # Accept both naming conventions: technique_train.npz (VocalSet)
+        # and technique_gtsinger_train.npz (GTSinger WAV extraction).
+        for fname in ("technique_train.npz", "technique_gtsinger_train.npz"):
+            tech_path = os.path.join(tech_dir, fname)
+            if os.path.exists(tech_path):
+                tech_datasets.append(TechniqueDataset(tech_dir, seq_len, filename=fname))
+                break
         else:
             print(f"  [warn] technique_train.npz not found in {tech_dir} — skipping")
 
@@ -768,8 +770,14 @@ def evaluate(model, data_dir, technique_dir, writer, epoch, device, args):
         print(f"  Macro RPA: {macro_rpa:.4f}")
 
     # ── Technique F1 evaluation ──────────────────────────────────────────
-    tech_path = technique_dir and os.path.join(technique_dir, "technique_test.npz")
-    if tech_path and os.path.exists(tech_path):
+    tech_path = None
+    if technique_dir:
+        for _fname in ("technique_test.npz", "technique_gtsinger_test.npz"):
+            _p = os.path.join(technique_dir, _fname)
+            if os.path.exists(_p):
+                tech_path = _p
+                break
+    if tech_path:
         data     = np.load(tech_path, allow_pickle=True)
         mel_flat = data["mel"].astype(np.float32)       # (total_frames, 40)
         tech_all = data["technique"].astype(np.float32) # (n_clips, N_TECH)
@@ -913,9 +921,11 @@ def main():
         args._sched_step = "iter"
 
     if resume_ckpt:
-        if "optimizer" in resume_ckpt:
+        if "optimizer" in resume_ckpt and not args.probe_mode:
             optimizer.load_state_dict(resume_ckpt["optimizer"])
-        if "scheduler" in resume_ckpt:
+        elif "optimizer" in resume_ckpt and args.probe_mode:
+            print("  Probe mode: skipping optimizer state (param groups changed)")
+        if "scheduler" in resume_ckpt and not args.probe_mode:
             scheduler.load_state_dict(resume_ckpt["scheduler"])
         del resume_ckpt
 
