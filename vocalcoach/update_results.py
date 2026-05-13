@@ -40,30 +40,51 @@ import torch
 
 # ── VocalCoach training defaults (must match train.py argparse defaults) ──────
 TRAIN_DEFAULTS = {
+    # Architecture
     "arch": "tcn", "causal": False, "hidden": None, "n_blocks": None,
+    "deep_technique_head": False,
+    # Training strategy
     "epochs": 100, "batch_size": 32, "lr": 3e-4, "seq_len": 300,
     "num_workers": 4,
+    "probe_mode": False, "freeze_backbone_epochs": 0,
+    "balance_datasets": False,
+    "curriculum": False, "curriculum_warmup": 30, "curriculum_ramp": 10,
+    "scheduler": "cosine_warmup", "grad_clip": 5.0,
+    # Loss weights
     "w_vad": 0.5, "w_pitch": 1.0, "w_technique": 2.0,
     "vad_pos_weight": 2.3, "technique_clip_weight": 1.0,
+    "technique_pos_weights": None,
     "pitch_sigma": 1.2,
-    "scheduler": "cosine_warmup",
+    # Augmentation
     "augment": "none",
     "snr_range": [-10.0, 30.0], "p_clean": 0.0, "snr_bias": 1.0,
     "freq_mask_param": 4, "n_freq_masks": 2,
     "time_mask_param": 10, "n_time_masks": 2,
-    "eval_every": 5, "patience": 0, "grad_clip": 5.0,
+    # Misc
+    "eval_every": 5, "patience": 0,
     "resume": None,
 }
 
 # Args shown in "Key args" column — hyperparams only; data paths shown separately.
 INTERESTING_ARGS = [
+    # Architecture
     "arch", "causal", "hidden", "n_blocks",
+    "deep_technique_head",
+    # Training strategy
     "seq_len", "epochs", "batch_size", "lr",
+    "probe_mode", "freeze_backbone_epochs",
+    "balance_datasets",
+    "curriculum", "curriculum_warmup", "curriculum_ramp",
+    "scheduler", "grad_clip",
+    # Loss weights
     "w_vad", "w_pitch", "w_technique",
-    "vad_pos_weight", "pitch_sigma",
-    "scheduler",
+    "vad_pos_weight", "technique_clip_weight",
+    "technique_pos_weights",
+    "pitch_sigma",
+    # Augmentation
     "augment", "snr_range", "p_clean", "snr_bias",
     "freq_mask_param", "n_freq_masks", "time_mask_param", "n_time_masks",
+    # Misc
     "patience", "resume",
 ]
 
@@ -469,10 +490,26 @@ def make_technique_row(num, name, tech, gt_tech=None):
     mf1 = _f(tech["macro_f1"]) if tech else "—"
     clip_acc = tech.get("clip_accuracy") if tech else None
     clip_s = f"{clip_acc:.1%}" if clip_acc is not None and clip_acc == clip_acc else "—"
-    gt_mf1 = _f(gt_tech["macro_f1"]) if gt_tech else "—"
     return (f"| {num} | `{name}` | "
             + " | ".join(c(n, tech) for n in TECHNIQUE_NAMES)
-            + f" | {mf1} | {clip_s} | {gt_mf1} |")
+            + f" | {mf1} | {clip_s} |")
+
+
+def make_gt_technique_row(num, name, gt_tech):
+    """Per-class F1 row for GTSinger held-out set (vibrato/breathy/falsetto only)."""
+    def c(cls):
+        d = gt_tech["per_class"].get(cls)
+        if d is None:
+            return "—"
+        f1 = d.get("f1")
+        return _f(f1) if f1 is not None else "—"
+    mf1 = _f(gt_tech["macro_f1"])
+    clip_acc = gt_tech.get("clip_accuracy")
+    clip_s = f"{clip_acc:.1%}" if clip_acc is not None and clip_acc == clip_acc else "—"
+    # Only the 3 GTSinger classes (belt/straight absent)
+    return (f"| {num} | `{name}` | "
+            f"{c('vibrato')} | {c('breathy')} | {c('falsetto')} | "
+            f"{mf1} | {clip_s} |")
 
 
 # ── Rebuild leaderboard from Runs rows ───────────────────────────────────────
@@ -529,7 +566,8 @@ def _rebuild_leaderboard(path):
 # ── Delete ────────────────────────────────────────────────────────────────────
 
 def delete_row(path, run_name):
-    sections = ["Runs", "Per-condition offRPA", "Per-technique F1", "Leaderboard"]
+    sections = ["Runs", "Per-condition offRPA", "Per-technique F1",
+                "Per-technique F1 (GTSinger held-out)", "Leaderboard"]
     removed_any = False
     for section in sections:
         with open(path) as f:
@@ -554,7 +592,8 @@ def delete_row(path, run_name):
 
     # Re-sync per-condition and per-technique numbering to Runs.
     name_to_num = _runs_name_to_number(path)
-    for section in ["Per-condition offRPA", "Per-technique F1"]:
+    for section in ["Per-condition offRPA", "Per-technique F1",
+                    "Per-technique F1 (GTSinger held-out)"]:
         with open(path) as f:
             lines = f.readlines()
         sl = _section_slice(lines, section)
@@ -664,12 +703,13 @@ def main():
         args_diff.append(f"`--onset-penalty`={args.onset_penalty}")
     baseline  = _extract_baseline(results_md)
 
-    runs_row = make_runs_row(
+    runs_row    = make_runs_row(
         "_", name, arch_cell, args_diff, args.note, overall, tech, baseline)
-    lb_row   = make_leaderboard_row(
+    lb_row      = make_leaderboard_row(
         "_", name, arch_cell, overall, tech, primary)
-    rpa_row  = make_rpa_row("_", name, pitch)
-    tech_row = make_technique_row("_", name, tech, gt_tech) if tech else None
+    rpa_row     = make_rpa_row("_", name, pitch)
+    tech_row    = make_technique_row("_", name, tech) if tech else None
+    gt_tech_row = make_gt_technique_row("_", name, gt_tech) if gt_tech else None
 
     # ── NanoPitch comparison (stdout only, pitch-only runs) ───────────────────
     # Shown only when no technique data — RPA comparison is the primary metric
@@ -710,15 +750,20 @@ def main():
     upsert(results_md, "Per-condition offRPA", name, rpa_row,
            sort_key=rpa_sort, renumber_from=name_to_num)
 
-    # 4. Per-technique F1 (sorted by macro F1 col — index -3: mf1 | clip_acc | gt_mf1)
-    if tech_row:
-        def f1_sort(row):
-            cells = [c.strip() for c in row.strip().strip("|").split("|")]
-            # columns: # | name | vib | bre | fal | belt | str | mf1 | clip_acc | gt_mf1
-            return _parse_num(cells[-3]) or 0.0
+    def _f1_sort(row):
+        cells = [c.strip() for c in row.strip().strip("|").split("|")]
+        # columns: # | name | ... | mf1 | clip_acc  (mf1 is second-to-last)
+        return _parse_num(cells[-2]) or 0.0
 
+    # 4. Per-technique F1 — VocalSet eval (sorted by macro F1)
+    if tech_row:
         upsert(results_md, "Per-technique F1", name, tech_row,
-               sort_key=f1_sort, renumber_from=name_to_num)
+               sort_key=_f1_sort, renumber_from=name_to_num)
+
+    # 5. Per-technique F1 (GTSinger held-out) — only when GTSinger eval was run
+    if gt_tech_row:
+        upsert(results_md, "Per-technique F1 (GTSinger held-out)", name, gt_tech_row,
+               sort_key=_f1_sort, renumber_from=name_to_num)
 
     print(f"\nDone — {results_md}")
 

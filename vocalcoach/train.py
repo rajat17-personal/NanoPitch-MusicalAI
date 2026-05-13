@@ -125,6 +125,11 @@ parser.add_argument("--deep-technique-head", action="store_true",
                     help="replace the single Linear technique head with a 2-layer MLP "
                          "(Linear→GELU→Dropout→Linear). Recommended with --probe-mode "
                          "where the backbone is frozen and the head must do more work.")
+parser.add_argument("--balance-datasets", action="store_true",
+                    help="use WeightedRandomSampler so each technique source dataset "
+                         "contributes equally to each batch. Fixes large/small dataset "
+                         "imbalance (e.g. GTSinger 10k vs VocalSet 824 clips) that "
+                         "causes minority-source classes to get F1=0.")
 
 # Device
 parser.add_argument("--device", type=str, default="cuda",
@@ -360,22 +365,28 @@ class TechniqueDataset(Dataset):
 
 
 def make_joint_loader(pitch_vad_dir, technique_dirs, seq_len, batch_size,
-                      num_workers):
+                      num_workers, balance_datasets=False):
     """Combine PitchVADDataset and one or more TechniqueDatasets via ConcatDataset.
 
     pitch_vad_dir: directory with clean.npz, or None to skip (technique-only mode).
     technique_dirs: list of directories each containing technique_train.npz.
+    balance_datasets: when True and multiple technique sources are present, use
+        WeightedRandomSampler so each source dataset contributes equally to each
+        batch regardless of its clip count. Fixes the 13:1 GTSinger/VocalSet
+        imbalance that causes belt/straight F1=0 in combined runs.
 
     Technique clips carry f0/vad labels, so all three heads (pitch, VAD, technique)
     train even when pitch_vad_dir is None. Omitting pitch_vad_dir avoids the overlap
     where VocalSet/GTSinger clips appear in both clean.npz and technique_train.npz.
     """
-    from torch.utils.data import ConcatDataset
+    from torch.utils.data import ConcatDataset, WeightedRandomSampler
 
     datasets = []
+    dataset_sizes = []
     if pitch_vad_dir is not None:
         pv = PitchVADDataset(pitch_vad_dir, seq_len)
         datasets.append(pv)
+        dataset_sizes.append(len(pv))
         n_pv = len(pv)
     else:
         n_pv = 0
@@ -393,6 +404,7 @@ def make_joint_loader(pitch_vad_dir, technique_dirs, seq_len, batch_size,
             print(f"  [warn] technique_train.npz not found in {tech_dir} — skipping")
 
     datasets.extend(tech_datasets)
+    dataset_sizes.extend(len(d) for d in tech_datasets)
 
     if not datasets:
         raise RuntimeError("No training data found — pass --data-dir and/or --technique-dirs.")
@@ -408,8 +420,34 @@ def make_joint_loader(pitch_vad_dir, technique_dirs, seq_len, batch_size,
         print(f"Pitch/VAD-only dataset: {n_pv} samples — technique head trains on pseudo-labels")
 
     dataset = ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
+
+    # Dataset-balanced sampler: each source dataset contributes 1/N_sources
+    # of each batch, regardless of its clip count.  This prevents a large
+    # GTSinger set (10 625 clips) from drowning out VocalSet (824 clips).
+    sampler = None
+    if balance_datasets and len(datasets) > 1:
+        weights = []
+        for size in dataset_sizes:
+            w = 1.0 / (len(datasets) * size)   # uniform within dataset, equal across
+            weights.extend([w] * size)
+        weights = torch.tensor(weights, dtype=torch.float64)
+        # Draw as many samples per epoch as the largest dataset × n_sources
+        # so no dataset is under-sampled relative to a shuffle baseline.
+        n_samples = max(dataset_sizes) * len(datasets)
+        sampler = WeightedRandomSampler(weights, num_samples=n_samples,
+                                        replacement=True)
+        print(f"  Dataset-balanced sampler: {len(datasets)} sources, "
+              f"{n_samples} samples/epoch (largest×{len(datasets)})")
+        print(f"  Per-source weights: " +
+              ", ".join(f"{sz} clips → {1/len(datasets):.1%}/epoch"
+                        for sz in dataset_sizes))
+
     loader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, drop_last=True,
+        dataset,
+        batch_size=batch_size,
+        shuffle=(sampler is None),
+        sampler=sampler,
+        drop_last=True,
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=(num_workers > 0),
@@ -913,7 +951,8 @@ def main():
 
     # Data
     loader = make_joint_loader(data_dir, tech_dirs, args.seq_len,
-                               args.batch_size, args.num_workers)
+                               args.batch_size, args.num_workers,
+                               balance_datasets=args.balance_datasets)
 
     # Optimizer + scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,

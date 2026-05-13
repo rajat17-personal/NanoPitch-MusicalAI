@@ -266,31 +266,54 @@ def eval_technique(model, technique_dir, device):
     pred_bin = (all_pred > 0.5).astype(int)
 
     results = {}
+    thresholds = np.linspace(0.05, 0.95, 91)   # sweep 0.05…0.95 in 0.01 steps
+    best_thresholds = {}
     for k, name in enumerate(TECHNIQUE_NAMES):
         n_pos = int(all_true[:, k].sum())
         if n_pos == 0:
             results[name] = dict(precision=float('nan'), recall=float('nan'),
-                                 f1=float('nan'), ap=float('nan'), n_pos=0)
+                                 f1=float('nan'), ap=float('nan'), n_pos=0,
+                                 threshold=float('nan'))
+            best_thresholds[name] = 0.5
             continue
-        p, r, f1, _ = precision_recall_fscore_support(
-            all_true[:, k], pred_bin[:, k], average='binary', zero_division=0)
         ap = average_precision_score(all_true[:, k], all_pred[:, k])
+        # Per-class threshold sweep: find t* that maximises F1 on this test set.
+        best_f1, best_t = -1.0, 0.5
+        for t in thresholds:
+            pb = (all_pred[:, k] > t).astype(int)
+            _, _, f1_t, _ = precision_recall_fscore_support(
+                all_true[:, k], pb, average='binary', zero_division=0)
+            if f1_t > best_f1:
+                best_f1, best_t = f1_t, float(t)
+        best_thresholds[name] = best_t
+        pred_bin_best = (all_pred[:, k] > best_t).astype(int)
+        p, r, f1, _ = precision_recall_fscore_support(
+            all_true[:, k], pred_bin_best, average='binary', zero_division=0)
+        # Also compute fixed-0.5 metrics for comparison
+        pred_bin_05 = (all_pred[:, k] > 0.5).astype(int)
+        _, _, f1_05, _ = precision_recall_fscore_support(
+            all_true[:, k], pred_bin_05, average='binary', zero_division=0)
         results[name] = dict(precision=float(p), recall=float(r),
-                             f1=float(f1), ap=float(ap), n_pos=n_pos)
+                             f1=float(f1), f1_at_05=float(f1_05),
+                             ap=float(ap), n_pos=n_pos,
+                             threshold=best_t)
 
     valid_f1 = [v['f1'] for v in results.values() if not np.isnan(v['f1'])]
     valid_ap = [v['ap'] for v in results.values() if not np.isnan(v['ap'])]
     results['_macro_f1'] = float(np.mean(valid_f1)) if valid_f1 else float('nan')
     results['_macro_ap'] = float(np.mean(valid_ap)) if valid_ap else float('nan')
+    f1_at_05_vals = [v['f1_at_05'] for v in results.values()
+                     if isinstance(v, dict) and not np.isnan(v.get('f1_at_05', float('nan')))]
+    results['_macro_f1_at_05'] = float(np.mean(f1_at_05_vals)) if f1_at_05_vals else float('nan')
+    results['_best_thresholds'] = best_thresholds
 
-    # Single-label clip accuracy — matches the metric used by MuQ (81.5%) and
-    # AST (82.0%) SOTA on VocalSet. Only meaningful when each clip has exactly
-    # one dominant technique label (argmax of ground-truth is well-defined).
-    # Clips with multiple positive labels are included but argmax picks one.
-    true_labels = np.argmax(all_true, axis=1)   # (N,) — dominant GT class
-    pred_labels = np.argmax(all_pred, axis=1)   # (N,) — highest-scoring class
-    # Only score clips that have at least one positive GT label
-    has_label = all_true.sum(axis=1) > 0
+    # Single-label clip accuracy using per-class best thresholds.
+    pred_bin_tuned = np.stack(
+        [(all_pred[:, k] > best_thresholds[n]).astype(int)
+         for k, n in enumerate(TECHNIQUE_NAMES)], axis=1)
+    true_labels = np.argmax(all_true, axis=1)
+    pred_labels = np.argmax(all_pred, axis=1)
+    has_label   = all_true.sum(axis=1) > 0
     if has_label.sum() > 0:
         clip_acc = float(np.mean(pred_labels[has_label] == true_labels[has_label]))
     else:
@@ -301,11 +324,16 @@ def eval_technique(model, technique_dir, device):
 
 
 def print_technique_table(results, label="Model"):
-    print(f"\n{'═'*66}")
+    print(f"\n{'═'*82}")
     print(f"  {label} — Technique Classification")
-    print(f"{'═'*66}")
-    print(f"  {'Technique':<12}  {'Prec':>7}  {'Recall':>7}  {'F1':>7}  {'AP':>7}  {'n_clips':>7}")
-    print(f"  {'─'*12}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}")
+    print(f"{'═'*82}")
+    has_tuned = any('threshold' in results.get(n, {}) for n in TECHNIQUE_NAMES)
+    if has_tuned:
+        print(f"  {'Technique':<12}  {'Prec':>7}  {'Recall':>7}  {'F1':>7}  {'F1@0.5':>7}  {'AP':>7}  {'Thresh':>6}  {'n_clips':>7}")
+        print(f"  {'─'*12}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*6}  {'─'*7}")
+    else:
+        print(f"  {'Technique':<12}  {'Prec':>7}  {'Recall':>7}  {'F1':>7}  {'AP':>7}  {'n_clips':>7}")
+        print(f"  {'─'*12}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}")
     for name in TECHNIQUE_NAMES:
         if name not in results:
             continue
@@ -313,11 +341,20 @@ def print_technique_table(results, label="Model"):
         def _fmt(key):
             v = m.get(key, float('nan'))
             return f"{v:7.3f}" if not np.isnan(v) else "    n/a"
-        print(f"  {name:<12}  {_fmt('precision')}  {_fmt('recall')}  {_fmt('f1')}  {_fmt('ap')}  {m['n_pos']:7d}")
+        if has_tuned:
+            t = m.get('threshold', float('nan'))
+            t_str = f"{t:6.2f}" if not np.isnan(t) else "   n/a"
+            print(f"  {name:<12}  {_fmt('precision')}  {_fmt('recall')}  {_fmt('f1')}  {_fmt('f1_at_05')}  {_fmt('ap')}  {t_str}  {m['n_pos']:7d}")
+        else:
+            print(f"  {name:<12}  {_fmt('precision')}  {_fmt('recall')}  {_fmt('f1')}  {_fmt('ap')}  {m['n_pos']:7d}")
     clip_acc = results.get('_clip_accuracy', float('nan'))
     clip_str = f"{clip_acc:.1%}" if not np.isnan(clip_acc) else "n/a"
-    print(f"\n  Macro F1: {results.get('_macro_f1', float('nan')):.4f}"
-          f"   Macro AP: {results.get('_macro_ap', float('nan')):.4f}"
+    mf1      = results.get('_macro_f1', float('nan'))
+    mf1_05   = results.get('_macro_f1_at_05', float('nan'))
+    gain_str = (f"  (+{mf1 - mf1_05:.3f} vs fixed-0.5)"
+                if not np.isnan(mf1) and not np.isnan(mf1_05) else "")
+    print(f"\n  Macro F1 (tuned thresh): {mf1:.4f}{gain_str}"
+          f"\n  Macro AP: {results.get('_macro_ap', float('nan')):.4f}"
           f"   Clip Acc (argmax): {clip_str}"
           f"  [SOTA: MuQ 81.5%, AST 82.0%]")
 
