@@ -191,6 +191,123 @@ Several reported metrics use independent measurement paths and can contradict ea
 
 ---
 
+## Perceptual Quality Scoring — Extended Options (Research Phase)
+
+Three approaches evaluated for replacing SingMOS-Pro, which showed ceiling effects (~4.8/5 for both amateur and professional PopBuTFy clips).
+
+---
+
+### Option A — Better Benchmark Datasets
+
+The goal is a benchmark that separates real amateur from professional singers across multiple quality dimensions.
+
+**Dataset landscape (as of May 2026):**
+
+| Dataset | Audio | Quality labels | Amateur singers | License | Notes |
+| --- | --- | --- | --- | --- | --- |
+| **ccmusic-database/acapella** | ✅ HuggingFace | 9-dim expert scores (Pitch, Rhythm, Timbre, Breath, Vibrato, Dynamic, Pronunciation, Vocal Range, Overall) — 4 judges, China Conservatory of Music | Wide ability range (score 1.25–10) | CC-BY-NC-ND 4.0 | 132 clips, 22 singers, Mandarin pop; best available multi-dim expert labels |
+| **SingEval** | ⚠️ Requires DAMP access | Crowdsourced holistic quality scores (public on GitHub) | ✅ Real Smule karaoke amateurs | Research only | 400 clips, 4 songs × 100 performers; audio not freely available |
+| **SingMOS-Pro** | ✅ HuggingFace | 3-dim MOS (Lyrics, Melody, Overall) — 78 annotators, 7,981 clips | ❌ Synthesized voice (SVS/SVC) | Open-source | Best for pre-training a scoring head; domain gap to real singing |
+| **SongEval** | ✅ HuggingFace | 5-dim expert MOS (Coherence, Memorability, Breathing/Phrasing, Structure, Musicality) — Shanghai Conservatory | ❌ Professional/produced recordings | CC-BY-NC-SA 4.0 | 2,399 songs, 140h; full songs with accompaniment |
+| **VocalSet** | ✅ Zenodo (CC-BY 4.0) | Technique labels only (no quality/MOS scores) | ❌ All professional singers | CC-BY 4.0 | 10h, 20 singers, 17 techniques; best for technique-aware encoding |
+| **DAMP / SingEval audio** | ❌ No longer available | — | ✅ Real Smule karaoke amateurs | Smule proprietary | Access programme discontinued; removed from consideration |
+
+**Key gap:** No public dataset combines real untrained amateur audio + multi-dimensional expert quality labels at meaningful scale. The closest pairing is:
+
+- **Professional reference:** ccmusic-database/acapella (9-dim expert scores, but pro-dominant)
+- **Amateur proxy:** PopBuTFy amateur side (simulated — professional singers deliberately performing poorly, not real novices)
+
+**For MOS labels on ccmusic/acapella:** Run SongEvalGenerator (Option C below, ~321M params) or SingMOS-Pro (~95M) — no need for the 7B QwenFeat model.
+
+**Other publicly available MOS/quality models:**
+
+| Model | Params | Output | Weights | Notes |
+|---|---|---|---|---|
+| **SongEvalGenerator** (audioscore, this repo) | ~321M | 5-dim: Coherence / Musicality / Memorability / Clarity / Naturalness [1–5] | ✅ In HF repo | MuQ backbone; no Qwen dependency; fastest to try |
+| **SingMOS-Pro predictor** | ~95M | 3-dim: Lyrics / Melody / Overall MOS [1–5] | ✅ HuggingFace (TangRain/SingMOS-Pro) | Trained on synthesized voice; domain gap to real singing |
+| **SingMOS predictor** | ~95M | Scalar MOS [1–5] | ✅ PyTorch Hub (South-Twilight/SingMOS) | Single dim; trained on SVS/SVC outputs |
+| **TG-Critic** | Small | Scalar quality score | Partial (GitHub YuejieGao/TG-CRITIC) | Reference-free; CQT-based; no confirmed weights |
+| **SCOREQ** | Unknown | Scalar quality | ✅ MIT (`pip install scoreq`) | Speech-domain; domain gap to singing |
+| UTMOS | ~95M | Scalar MOS | ✅ Apache 2.0 | Poor on singing; do not use without re-fine-tuning |
+
+---
+
+### Option B — Lightweight Scoring Head on VocalCoach Backbone
+
+Attach quality regression heads directly to the existing VocalCoach Conformer backbone. The backbone already runs for every coaching inference; adding a scoring head costs negligible additional compute.
+
+**How it works:**
+
+1. Take the mean-pooled hidden states from the frozen VocalCoach Conformer backbone
+2. Add parallel linear heads — one per quality dimension (e.g. Pitch Accuracy, Breath Control, Timbre, Overall)
+3. Train heads only; backbone stays frozen (same MERT-style linear probe approach used for `head_technique`)
+
+**Inference overhead:** A linear head maps `hidden_dim → n_dims` (e.g. 256 → 4). This adds ~1K parameters and sub-millisecond latency — effectively zero relative to the backbone forward pass.
+
+**Training pipeline (recommended):**
+
+1. Pre-train head on **SingMOS-Pro** (7,981 clips, 3-dim MOS) — establishes quality-discriminative representations in the head weights
+2. Fine-tune probe on **ccmusic-database/acapella** (132 clips, 9-dim expert scores) — maps to domain-specific dimensions (Breath Control, Timbre, Vibrato, etc.)
+3. Apply **contrastive calibration** on **PopBuTFy pairs** — anchors the output scale to real amateur vs. professional separation
+
+**What is contrastive calibration?**
+Rather than training with absolute MOS scores ("this clip is 3.2/5"), contrastive calibration trains with *relative pairs*: "clip A (professional) should score higher than clip B (amateur)." PopBuTFy provides this supervision for free — every `(pro, amateur)` pair is a labelled ranking without any human MOS annotation. The model learns to push professional scores above amateur scores, calibrating where each skill tier lands on the output scale. This uses a pairwise ranking loss (e.g. margin ranking loss: `max(0, margin − (score_pro − score_amateur))`). It does not change what the model measures — it anchors the scale to real skill separation observed in the data.
+
+**Data constraint:** 132 clips (ccmusic) is at the edge of the linear probe regime. Pre-training on SingMOS-Pro first is essential. The VoiceMOS 2024 semi-supervised track demonstrated SSL-MOS heads can be trained with "very small amounts of labeled data" — 132 expert-scored clips is feasible for a linear probe on a frozen backbone.
+
+**Key prior art:**
+
+- PS-SQA (arXiv:2411.11123, Nov 2024) — SSL + regression head for singing, low-resource bias correction, VoiceMOS 2024 Track 2 winner
+- SAMOS (arXiv:2411.11232, Nov 2024) — multi-task SSL heads for singing MOS
+- SingMOS-Pro (arXiv:2510.01812, Oct 2025) — multi-dim singing MOS predictor with released weights
+
+---
+
+### Option C — SongEvalGenerator (audioscore, Lightweight Standalone)
+
+The `audioscore/` sub-directory of the QwenFeat-Vocal-Score repository contains a fully standalone scoring system requiring no Qwen dependency.
+
+**Architecture:**
+
+```text
+MuQ-large-msd-iter  (~300M params, music SSL encoder, 24 kHz input)
+         ↓  hidden_states[6]  (layer 6, shape [B, T, 1024])
+SongEvalGenerator   (~21M params)
+  ├─ FFD: Linear(1024→4096) → ReLU → Linear(4096→1024)
+  ├─ 4× MultiheadAttention(d=1024, h=8, dropout=0.2)
+  ├─ Linear(2048→5)  [mean-pool + max-pool concatenated]
+  └─ Tanh() * 2.0 + 3   →  scores in range [1, 5]
+         ↓
+5 dimensions: Coherence · Musicality · Memorability · Clarity · Naturalness
+```
+
+**Key facts:**
+
+- Total: ~321M params vs ~7B for QwenFeat LoRA system (~22× smaller)
+- Checkpoint: `ckpts/SongEvalGenerator/step_2_al_audio/best_model_step_132000/` — 151 MB total (`muq_lora.pt` 50 MB + `weights.pt` 101 MB)
+- Production `generate_tag()` returns a single scalar (index 1 / Musicality, inverted); the standalone `SongEval/eval.py` exposes all 5 dimensions
+- No Qwen dependency; `audioscore/requirements.txt` lists only `muq`, `peft`, `transformers`, `torchaudio`, `librosa`, `soundfile`, `safetensors`
+
+**Approximate dimension mapping to VocalCoach dimensions:**
+
+| SongEvalGenerator dim | VocalCoach / QwenFeat approximate equivalent |
+|---|---|
+| Musicality | Overall quality proxy (most useful for coaching) |
+| Clarity | Vocal Technique / diction / articulation |
+| Naturalness | Breath Control / phrasing |
+| Coherence | Emotional Expression / musical continuity |
+| Memorability | Timbre / voice distinctiveness |
+
+**Implementation status:** Colab cells 7a → 7b → 7c added to `notebooks/VocalVerse1_Colab.ipynb`:
+
+- **7a**: Downloads audioscore source + SongEvalGenerator checkpoint (~200 MB; skips the 7B model entirely)
+- **7b**: Loads the 321M model, defines `lite_score(path)` helper
+- **7c**: Side-by-side comparison table — SongEvalGenerator vs QwenFeat 4-LoRA on the same PopBuTFy clips, with per-clip timing
+
+**Next step:** Run cell 7c on the same `Female1 / my_heart_will_go_on` clips used for the LoRA comparison. If Musicality or Naturalness separates amateur from professional by ≥0.3 points, SongEvalGenerator is a viable drop-in replacement for SingMOS-Pro in `vocalcoach/singmos.py`.
+
+---
+
 ## Evaluation Metrics Reference
 
 **Pitch + VAD** (`evaluate.py` → offline Viterbi decoder):
