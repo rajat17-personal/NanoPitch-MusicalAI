@@ -6,3 +6,11 @@ __pycache__/
 
 # macOS / editor noise
 .DS_Store
+
+emsdk
+
+runs/
+RMVPE/
+*.zip
+rmvpe.pt
+VOCALCOACH_*.md

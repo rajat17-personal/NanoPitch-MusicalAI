@@ -7,7 +7,7 @@ into RESULTS.MD.
 
 Usage:
     python update_results.py --run-dir ./runs/my_first_model \
-                             --data-dir ../data \
+                             [--data-dir ../data] \
                              [--checkpoint best_macro_rpa.pth] \
                              [--name baseline] \
                              [--note "short description"] \
@@ -480,7 +480,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run-dir", default=None,
                    help="path to run directory containing checkpoints/")
-    p.add_argument("--data-dir", default=None,
+    p.add_argument("--data-dir", default="../data",
                    help="folder containing clean.npz, noise.npz, test.npz")
     p.add_argument("--checkpoint", default="best.pth",
                    help="checkpoint filename inside <run-dir>/checkpoints/")
