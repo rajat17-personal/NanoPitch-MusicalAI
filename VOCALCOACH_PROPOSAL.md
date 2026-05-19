@@ -91,24 +91,16 @@ Inspired by MERT (Li et al., ICLR 2024): pre-train backbone on primary task, fre
 
 ### Technique Classification — Best Checkpoints
 
-| Metric | Best run | Value | Note |
-|---|---|---|---|
-| **mF1 (VocalSet)** | Run 10 (joint, best loss) | **0.810** | VDR=26.7% — pitch unusable |
-| **mF1 (probe-mode)** | Run 19 `conformer_probe_technique` | **0.395** | VDR=61.5%, RPA=99.5% — deployed |
-| **mAP** | Run 10 | **0.833** | Same caveat as mF1 |
-| **Clip Acc** | Run 12 `conformer_vocalset_rescaled` | **63.5%** | vs MuQ SOTA 81.5% / AST 82.0% |
-| **Vibrato F1** | Run 12 `conformer_vocalset_rescaled` | **0.944** | Best single-class |
-| **Breathy F1** | Run 10 | **0.919** | Best single-class |
+| Metric              | Best run                              | Value     | Note                                  |
+| ------------------- | ------------------------------------- | --------- | ------------------------------------- |
+| **mF1 (VocalSet)**  | Run 10 (joint, best loss)             | **0.810** | VDR=26.7% — pitch unusable            |
+| **mF1 (probe-mode)**| Run 19 `conformer_probe_technique`    | **0.395** | VDR=61.5%, RPA=99.5% — deployed       |
+| **mAP**             | Run 10                                | **0.833** | Same caveat as mF1                    |
+| **Clip Acc**        | Run 12 `conformer_vocalset_rescaled`  | **63.5%** | vs MuQ SOTA 81.5% / AST 82.0%         |
+| **Vibrato F1**      | Run 12 `conformer_vocalset_rescaled`  | **0.944** | Best single-class                     |
+| **Breathy F1**      | Run 10                                | **0.919** | Best single-class                     |
 
 **Trade-off summary:** Best mF1 (Run 10, 0.810) comes at the cost of VDR=26.7% — the model skips ~73% of voiced frames and is unusable for pitch/VAD coaching. The probe-mode checkpoint (Run 19) sacrifices ~41 mF1 points to preserve pitch tracking. This is the correct trade-off for a coaching app where pitch accuracy is primary.
-
-### Per-technique F1 — Deployed Checkpoint (Run 19, Conformer Probe)
-
-| vibrato | breathy | falsetto | belt | straight | mF1 | Clip Acc |
-|---|---|---|---|---|---|---|
-| 0.438 | 0.620 | — | 0.000 | 0.524 | 0.395 | 40.9% |
-
-Belt F1=0.000 and falsetto unlearnable (no VocalSet falsetto clips). These are known gaps.
 
 ---
 
@@ -118,12 +110,12 @@ Belt F1=0.000 and falsetto unlearnable (no VocalSet falsetto clips). These are k
 
 Derived from the VocalCoach model's F0 + VAD outputs. Computed post-inference, no additional training required:
 
-| Feature | Method | Notes |
-|---|---|---|
-| Vibrato rate/depth | Autocorrelation of detrended F0 residual, 4–8 Hz window | Requires ≥300 ms voiced segment. Conflicts with classifier-based `technique.vibrato` — both measure vibrato but via independent paths |
-| HNR, jitter, shimmer | Cycle-to-cycle F0 statistics | Values unreliable in absolute terms due to noisy probe-mode F0; meaningful only relative to PopBuTFy population medians |
-| DTW pitch deviation | Pure-numpy DTW in cents space, mean-normalised | Key-invariant; measures pitch contour shape match vs a reference recording |
-| Phrase segmentation | VAD gaps ≥150 ms split phrases; <100 ms segments dropped | Uses pitch-confidence proxy for voicing (30% of clip max) in probe checkpoint |
+| Feature              | Method                                                    | Notes                                                                                                                                  |
+| -------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Vibrato rate/depth   | Autocorrelation of detrended F0 residual, 4–8 Hz window  | Requires ≥300 ms voiced segment. Conflicts with classifier-based `technique.vibrato` — both measure vibrato but via independent paths   |
+| HNR, jitter, shimmer | Cycle-to-cycle F0 statistics                              | Values unreliable in absolute terms due to noisy probe-mode F0; meaningful only relative to PopBuTFy population medians                |
+| DTW pitch deviation  | Pure-numpy DTW in cents space, mean-normalised            | Key-invariant; measures pitch contour shape match vs a reference recording                                                             |
+| Phrase segmentation  | VAD gaps ≥150 ms split phrases; <100 ms segments dropped | Uses pitch-confidence proxy for voicing (30% of clip max) in probe checkpoint                                                           |
 
 ### Population Baselines (D5 — Implemented)
 
@@ -152,9 +144,9 @@ Both models are from Wang et al., *"Singing Timbre Popularity Assessment Based o
 
 ---
 
-## Coaching Pipeline (Phase 2 — Implemented)
+## Coaching Pipeline 
 
-Full inference pipeline implemented as a FastAPI server (`vocalcoach/api.py`):
+Full inference pipeline implemented (`vocalcoach/api.py`):
 
 ```
 Audio clip → VocalCoach model (F0 + VAD + technique)
