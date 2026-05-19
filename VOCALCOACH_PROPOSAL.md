@@ -13,7 +13,7 @@ Multi-task singing analysis model: one audio clip in → pitch track + voice act
 
 ## Architecture: TCN vs Conformer
 
-Two architectures trained for comparision, both ~450K parameters, `causal=False` (offline):
+Two architectures trained for comparison, both ~450K parameters, `causal=False` (offline):
 
 | | TCN | Conformer |
 |---|---|---|
@@ -21,7 +21,7 @@ Two architectures trained for comparision, both ~450K parameters, `causal=False`
 | Pitch baseline (no technique) | RPA 98.5%, VDR 72.3% | RPA 99.3%, VDR 80.4% ← best |
 | Live mode | Retrain `causal=True` → ONNX → browser | Not streaming-compatible; fallback to NanoPitch GRU |
 
-**Conformer wins on pitch accuracy.** TCN is the live-mode candidate (causal retrain, Phase 2).
+**Conformer wins on pitch accuracy.** TCN is the live-mode candidate (causal retrain).
 
 ---
 
@@ -35,6 +35,7 @@ Two architectures trained for comparision, both ~450K parameters, `causal=False`
 | **FSDNoisy18k** (42h) | Noise augmentation | `noise.npz` — mixed into training batches via log-mel `logaddexp` at random SNR [−10, +30 dB] |
 | **NanoPitch test set** | Pitch + VAD evaluation | 100 GTSinger held-out clips at 6 SNR conditions (−5, 0, +5, +10, +20 dB, clean) |
 | **VocalSet held-out split** | Technique evaluation | Singers m2, m4, f4, f8 withheld — same split as VocalSet paper |
+| **PopBuTFy** | Population baseline evaluation (D5) | 28,508 clips across amateur/professional singers. Used to build population-level medians for coaching context — not used in model training. |
 
 **Known gap:** VocalSet has no falsetto clips; GTSinger technique data is 50% falsetto but label quality is poor (noisy clip-level annotation). Falsetto is currently unlearnable without a better-labelled source.
 
@@ -63,36 +64,134 @@ Inspired by MERT (Li et al., ICLR 2024): pre-train backbone on primary task, fre
 
 - Load best pitch checkpoint (Run 4, Conformer, VDR=80.4%)
 - Freeze: `input_proj` + all backbone blocks + `head_pitch` + `head_vad`
-- Train only: `head_technique` (single `Linear(128→5)`) on VocalSet
+- Train only: `head_technique` on VocalSet
 
-**Results:**
+---
 
-| Run | Approach | VDR | RPA | mF1 |
+## Best Results (28 runs)
+
+### Pitch + VAD — Best Checkpoints
+
+| Metric | Best run | Value | Architecture |
+|---|---|---|---|
+| **offRPA** | Run 19 `conformer_probe_technique` | **99.5%** | Conformer / noncausal |
+| **offVDR** | Run 4 `conformer_gtsinger_noncausal_aug` | **80.4%** | Conformer / noncausal |
+| **offMed¢** | Run 19 `conformer_probe_technique` | **1.2 ¢** | Conformer / noncausal |
+| VAD Acc | Run 9 `conformer_vocalset_gtsinger_noncausal_aug_r10` | 87.1% | Conformer / noncausal |
+
+**Probe-mode Conformer (Run 19) is the deployed checkpoint**: highest RPA (99.5%) and best median pitch error (1.2¢). VDR (61.5%) trails the pitch-only baseline (80.4%) due to domain mismatch on VocalSet mel at eval time.
+
+**TCN probe (Run 21)** achieves VDR 76.9% (highest of any run with technique), making it the best live-mode candidate once causal retraining is complete.
+
+### Per-SNR offRPA — Conformer Probe (Run 19)
+
+| Condition | −5 dB | 0 dB | +5 dB | +10 dB | +20 dB | clean | Macro     |
+| --------- | ----- | ---- | ----- | ------ | ------ | ----- | --------- |
+| offRPA    | 99.0  | 99.0 | 99.6  | 99.7   | 99.6   | 99.8  | **99.5%** |
+
+### Technique Classification — Best Checkpoints
+
+| Metric              | Best run                              | Value     | Note                                  |
+| ------------------- | ------------------------------------- | --------- | ------------------------------------- |
+| **mF1 (VocalSet)**  | Run 10 (joint, best loss)             | **0.810** | VDR=26.7% — pitch unusable            |
+| **mF1 (probe-mode)**| Run 19 `conformer_probe_technique`    | **0.395** | VDR=61.5%, RPA=99.5% — deployed       |
+| **mAP**             | Run 10                                | **0.833** | Same caveat as mF1                    |
+| **Clip Acc**        | Run 12 `conformer_vocalset_rescaled`  | **63.5%** | vs MuQ SOTA 81.5% / AST 82.0%         |
+| **Vibrato F1**      | Run 12 `conformer_vocalset_rescaled`  | **0.944** | Best single-class                     |
+| **Breathy F1**      | Run 10                                | **0.919** | Best single-class                     |
+
+**Trade-off summary:** Best mF1 (Run 10, 0.810) comes at the cost of VDR=26.7% — the model skips ~73% of voiced frames and is unusable for pitch/VAD coaching. The probe-mode checkpoint (Run 19) sacrifices ~41 mF1 points to preserve pitch tracking. This is the correct trade-off for a coaching app where pitch accuracy is primary.
+
+---
+
+## Evaluation Strategy
+
+### Signal-Processing Features (Phase 2 — Implemented)
+
+Derived from the VocalCoach model's F0 + VAD outputs. Computed post-inference, no additional training required:
+
+| Feature              | Method                                                    | Notes                                                                                                                                  |
+| -------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Vibrato rate/depth   | Autocorrelation of detrended F0 residual, 4–8 Hz window  | Requires ≥300 ms voiced segment. Conflicts with classifier-based `technique.vibrato` — both measure vibrato but via independent paths   |
+| HNR, jitter, shimmer | Cycle-to-cycle F0 statistics                              | Values unreliable in absolute terms due to noisy probe-mode F0; meaningful only relative to PopBuTFy population medians                |
+| DTW pitch deviation  | Pure-numpy DTW in cents space, mean-normalised            | Key-invariant; measures pitch contour shape match vs a reference recording                                                             |
+| Phrase segmentation  | VAD gaps ≥150 ms split phrases; <100 ms segments dropped | Uses pitch-confidence proxy for voicing (30% of clip max) in probe checkpoint                                                           |
+
+### Population Baselines (D5 — Implemented)
+
+`scripts/buildPopBuTFyBaselines.py` ran VocalCoach inference across all 28,508 PopBuTFy clips (14,525 amateur + 13,983 professional) to build population-level medians. Output: `data/popbutfy_baselines.json`.
+
+Each coaching report includes a `population_context` block comparing the user's metrics to amateur/professional medians with band labels: `pro_range` / `approaching_pro` / `amateur_range` / `below_amateur`.
+
+**Known limitation:** Most acoustic metrics (HNR, jitter, shimmer) show small amateur/professional separation because both groups are studio recordings and the noisy probe-mode F0 inflates all cycle-to-cycle variance estimates equally.
+
+### Perceptual Quality Scoring (D6 — Partially Implemented, Under Review)
+
+**SingMOS-Pro** (wav2vec2-large, trained on SVS/SVC/SVR data): implemented in `vocalcoach/singmos.py`. Scores audio quality on a 1–5 MOS scale.
+
+**Problem identified:** SingMOS-Pro does not meaningfully differentiate amateur from professional singing in PopBuTFy — both groups score ~4.8 (ceiling effect). Both groups are studio recordings; MOS measures perceived acoustic quality / naturalness, not singing skill. End users of a vocal coaching app are not expected to have studio microphones, so MOS is not a useful signal for the core coaching task.
+
+**Plan:** Replace SingMOS-Pro with a singing-specific perceptual scorer. Two candidates evaluated:
+
+| Model | Size | Output | Amateur/Pro differentiation | Status |
 |---|---|---|---|---|
-| 4 | Conformer pitch-only baseline | 80.4% | 99.3% | — |
-| 12 | Best joint model (rescaled) | 57.3% | 97.3% | 0.655 |
-| **19** | **Conformer probe-mode** | **61.5%** | **99.5% ↑** | **0.395** |
-| **21** | **TCN probe-mode** | **76.9% ↑** | **97.8%** | **0.374** |
+| **VocalVerse2 / MuQ** (audioscore) | Small (MuQ encoder + scoring head) | Single aesthetic score 50–99 | Unknown — to be verified on PopBuTFy | Local eval script written: `scripts/score_vocalverse2.py` |
+| **VocalVerse1 / Qwen2-Audio-7B** (qwenaudio) | ~15 GB fp16 + 4 LoRA adapters | 4 scores: Timbre / Breath / Emotion / Technique | Unknown — to be verified | Colab notebook written: `notebooks/VocalVerse1_Colab.ipynb` |
 
-Run 19 is the **only run in 21 experiments where RPA improved** over the pitch baseline (+0.2%). Run 21 VDR (76.9%) exceeds the TCN pitch-only baseline (72.3%) — first time adding technique has not hurt pitch tracking.
+Both models are from Wang et al., *"Singing Timbre Popularity Assessment Based on Multimodal Large Foundation Model"*, ACM MM 2025 ([doi:10.1145/3746027.3758148](https://doi.org/10.1145/3746027.3758148)). Trained on expert-annotated VocalVerse dataset (165 amateur raters + 4 professional vocal experts, 4 dimensions).
 
----
-
-## Open Questions for Final Project
-
-1. **mF1 gap**: Probe-mode mF1 (0.374–0.395) is lower than best joint run (0.810, Run 10). The probe head is a single linear layer with 50 epochs on pitch-optimised features. **Plan:** deeper probe head (`Linear(128→64) → GELU → Linear(64→5)`) + 100 epochs + GTSinger technique data added to probe training. Expected gain: 10–15 mF1 points without touching backbone.
-
-2. **Remaining VDR gap (~19 points, Conformer)**: Frozen `head_vad` was trained on GTSinger mel; VocalSet mel at eval time is a different distribution. The gap is a domain mismatch floor, not a gradient conflict artifact. **Question:** does this matter for the vocal coaching? VDR=61.5% on a held-out GTSinger test set is likely higher on real user audio (closer to GTSinger distribution than VocalSet exercises).
-
-3. **Falsetto coverage**: VocalSet has no falsetto clips; GTSinger technique dataset is 50% falsetto. Probe head trained on VocalSet cannot learn falsetto. **Plan:** add GTSinger technique clips to probe training data.
-
-4. **Phase 2 architecture decision**: Use **Conformer** as the offline analysis backbone (best RPA/VDR), **TCN causal retrain** for live streaming pitch. Probe-mode is the confirmed training strategy for any new task heads added in Phase 2.
+**Next step:** Run both on a PopBuTFy song pair (amateur vs professional) and check whether pro scores consistently exceed amateur scores. If separation is meaningful, integrate the best model as the MOS replacement in the API and population context chart.
 
 ---
 
-## Evaluation
+## Coaching Pipeline 
 
-Two evaluation scripts track all runs in `VOCALCOACH_RESULTS.md`:
+Full inference pipeline implemented (`vocalcoach/api.py`):
+
+```
+Audio clip → VocalCoach model (F0 + VAD + technique)
+           → signal-processing features (HNR, jitter, vibrato, DTW)
+           → score_report() [rule-based coaching, 0–100 score]
+           → compare_to_baselines() [PopBuTFy population context]
+           → [optional] generate_critique() [Claude API LLM critique]
+           → JSON coaching report
+```
+
+Key components:
+- `vocalcoach/coach.py` — rule-based coaching with per-axis observations and weighted overall score
+- `vocalcoach/features.py` — phrase segmentation, vibrato detection, DTW
+- `vocalcoach/singmos.py` — SingMOS-Pro wrapper (graceful degradation if unavailable)
+- `notebooks/VocalCoach_Inference.ipynb` — full demo notebook with population context chart, DTW timeline, phrase analysis, technique radar
+
+---
+
+## Metric Conflicts and Known Issues
+
+Several reported metrics use independent measurement paths and can contradict each other:
+
+| Conflict | Root cause |
+|---|---|
+| `technique.vibrato` (classifier) ≠ `vibrato.n_vibrato_phrases` (signal-proc) | Classifier fires on mel-spectrogram pattern; vibrato detector requires clean autocorrelation of F0. Noisy probe-mode F0 fails the 0.3 regularity threshold even when the classifier correctly detects vibrato. |
+| High `jitter_mean_pct` / negative `hnr_mean_db` | Probe-mode F0 is noisy; cycle-to-cycle statistics are inflated. Values are internally consistent (same systematic bias) so population comparisons are valid, but absolute values are meaningless. |
+| `pitch.f0_stability_std_hz` flags vibrato singers as "unstable" | Correct vibrato oscillation raises std. This metric does not distinguish intentional vibrato from pitch drift. |
+| `n_phrases` in summary vs phrase count in list | `summarise()` returns `n_voiced_segments` (raw VAD onset count); `phrase_aggregate()` returns merged/filtered phrase count. Different denominators — expected. |
+
+**Root cause for most issues:** Probe-mode checkpoint F0 is used for both phrase segmentation and acoustic feature extraction. A RMVPE-based F0 extractor (independent of the VocalCoach model) would fix HNR/jitter/vibrato detection quality without retraining.
+
+---
+
+## Open Questions / Pending
+
+1. **Perceptual scorer:** Run VocalVerse1 (Colab) and VocalVerse2 (local) on PopBuTFy pairs; confirm amateur/pro separation before integrating into API.
+2. **mF1 gap (probe-mode 0.395 vs joint-best 0.810):** Deeper probe head (`Linear(128→64)→GELU→Linear(64→5)`) + 100 epochs expected to gain 10–15 mF1 points.
+3. **Belt F1=0.000 in probe runs:** Belt is the rarest VocalSet class; pos_weight tuning needed.
+4. **Falsetto coverage:** VocalSet has no falsetto. Requires a new data source or using GTSinger technique clips with cleaned labels.
+5. **RMVPE F0 for acoustic features:** Would fix HNR/jitter/shimmer accuracy and improve vibrato detection — independent of VocalCoach model training.
+6. **Live causal TCN retrain:** TCN probe (Run 21, VDR=76.9%) is the confirmed live candidate; causal retrain pending.
+
+---
+
+## Evaluation Metrics Reference
 
 **Pitch + VAD** (`evaluate.py` → offline Viterbi decoder):
 
@@ -112,12 +211,4 @@ Two evaluation scripts track all runs in `VOCALCOACH_RESULTS.md`:
 | mAP | Mean Average Precision — threshold-free technique ranking quality |
 | Clip Acc | `mean(frame_probs) > 0.5` argmax accuracy — matches MuQ / AST SOTA metric (81.5% / 82.0%) |
 
-**Key evaluation insight:** VDR was the canary for joint-training health across all 21 runs. RPA measures accuracy *on frames the model chose to decode* — a model can achieve high RPA by silently skipping most voiced frames. VDR catches this; joint training consistently collapsed VDR to <30% while RPA appeared healthy.
-
----
-
-## What's Working / What's Next
-
-**Done:** Two architectures trained and compared · multi-task training pipeline (noise augmentation, SpecAugment, curriculum, pos_weights, staged freeze) · probe-mode implementation confirmed · 21 experiment runs tracked
-
-**Phase 2 targets:** Deeper probe head · DTW reference pitch comparison (primary coaching metric) · post-processing feature pipeline (vibrato rate/depth, HNR, jitter) ·
+**Key evaluation insight:** VDR was the canary for joint-training health across all 28 runs. RPA measures accuracy *on frames the model chose to decode* — a model can achieve high RPA by silently skipping most voiced frames. VDR catches this; joint training consistently collapsed VDR to <30% while RPA appeared healthy.
