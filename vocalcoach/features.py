@@ -7,6 +7,7 @@ F0/VAD outputs. All functions accept numpy arrays and return numpy arrays —
 no PyTorch required. Designed to run offline (post-session analysis).
 
 Features implemented (from the full taxonomy):
+  5-7 Vibrato rate, depth, regularity  per voiced phrase (autocorrelation of F0)
   14  RMS dynamics            per frame
   15  HNR                     per frame (requires F0 for pitch-lag autocorr)
   16  Spectral centroid        per frame
@@ -16,17 +17,26 @@ Features implemented (from the full taxonomy):
   20  MFCCs (13 coeffs)        per frame
   21  Breath detection         returns breath event intervals
   22  Vocal onset steepness    per note onset
+  23  DTW reference distance   per-phrase scalar vs reference F0
+  Ph  Phrase aggregation       per-phrase coaching metrics
 
 Usage
 -----
-    from vocalcoach.features import extract_all
+    from vocalcoach.features import extract_all, phrase_aggregate
 
     feats = extract_all(y, sr=16000, f0_hz=f0, vad=vad)
+    phrases = phrase_aggregate(f0_hz, vad, technique_probs, sr=16000)
     # feats is a dict with keys matching the taxonomy IDs above
 """
 
 import numpy as np
 import librosa
+
+try:
+    from scipy.spatial.distance import cdist
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
 
 # ── Shared constants ────────────────────────────────────────────────
 SR          = 16000
@@ -241,6 +251,8 @@ def compute_shimmer(y, f0_hz, sr=SR, hop_length=HOP_LENGTH):
             if sample_s >= len(y):
                 break
             cycle = y[sample_s:sample_e]
+            if len(cycle) == 0:
+                break
             amps.append(float(np.max(np.abs(cycle)) + 1e-10))
 
         if len(amps) < 2:
@@ -357,6 +369,316 @@ def compute_onset_steepness(rms_db, vad, hop_s=HOP_LENGTH / SR,
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Features 5-7 — Vibrato Rate, Depth, Regularity
+# ═══════════════════════════════════════════════════════════════════════
+
+def compute_vibrato(f0_hz, sr=SR, hop_length=HOP_LENGTH,
+                    min_phrase_frames=30, rate_range=(4.0, 8.0),
+                    depth_cents_min=20.0):
+    """Detect vibrato in voiced phrases via short-time F0 autocorrelation.
+
+    For each continuous voiced phrase, converts F0 to cents, removes the
+    linear trend (pitch contour), then finds the dominant periodic component
+    via autocorrelation. A phrase is considered to have vibrato when the peak
+    autocorrelation lag falls within the classical vibrato rate range (4-8 Hz)
+    and depth exceeds `depth_cents_min`.
+
+    Args:
+        f0_hz:          (T,) F0 in Hz (0 = unvoiced)
+        sr:             sample rate
+        hop_length:     hop in samples (sets frame duration)
+        min_phrase_frames: minimum voiced segment length to analyse
+        rate_range:     (min_hz, max_hz) for valid vibrato rate
+        depth_cents_min: minimum peak-to-trough extent to report vibrato
+
+    Returns:
+        list of dicts, one per phrase:
+            start_frame, end_frame,
+            has_vibrato (bool),
+            rate_hz (float | None),
+            depth_cents (float | None),  — peak-to-trough range in cents
+            regularity (float | None)    — normalised autocorrelation peak [0,1]
+    """
+    hop_s = hop_length / sr
+    frame_rate = 1.0 / hop_s  # frames per second
+
+    voiced = f0_hz > 0
+    changes = np.diff(voiced.astype(int), prepend=0, append=0)
+    starts = np.where(changes == 1)[0]
+    ends   = np.where(changes == -1)[0]
+
+    results = []
+    for s, e in zip(starts, ends):
+        rec = {"start_frame": int(s), "end_frame": int(e),
+               "has_vibrato": False, "rate_hz": None,
+               "depth_cents": None, "regularity": None}
+
+        if e - s < min_phrase_frames:
+            results.append(rec)
+            continue
+
+        seg = f0_hz[s:e].astype(np.float64)
+
+        # Convert to cents relative to mean pitch
+        cents = 1200.0 * np.log2(seg / (np.mean(seg) + 1e-10))
+
+        # Remove linear trend (slow pitch glide)
+        t = np.arange(len(cents))
+        trend = np.polyval(np.polyfit(t, cents, 1), t)
+        residual = cents - trend
+
+        # Normalised autocorrelation of residual
+        ac = np.correlate(residual, residual, mode='full')
+        ac = ac[len(residual) - 1:]
+        if ac[0] < 1e-12:
+            results.append(rec)
+            continue
+        ac /= ac[0]
+
+        # Search lags corresponding to rate_range
+        lag_min = max(1, int(frame_rate / rate_range[1]))
+        lag_max = min(len(ac) - 1, int(frame_rate / rate_range[0]))
+        if lag_min >= lag_max:
+            results.append(rec)
+            continue
+
+        peak_lag = lag_min + int(np.argmax(ac[lag_min:lag_max + 1]))
+        peak_val = float(ac[peak_lag])
+
+        rate_hz = float(frame_rate / peak_lag)
+        depth_cents = float(np.max(residual) - np.min(residual))
+
+        if peak_val > 0.3 and depth_cents >= depth_cents_min:
+            rec["has_vibrato"] = True
+            rec["rate_hz"] = rate_hz
+            rec["depth_cents"] = depth_cents
+            rec["regularity"] = peak_val
+
+        results.append(rec)
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Feature 23 — DTW Reference Pitch Comparison
+# ═══════════════════════════════════════════════════════════════════════
+
+def compute_dtw_distance(f0_user, f0_ref, hop_length=HOP_LENGTH, sr=SR,
+                         voiced_only=True):
+    """DTW alignment of user F0 against a reference F0 track.
+
+    Both sequences are converted to cents relative to their mean pitch so that
+    absolute key/transposition differences are removed. Only voiced frames (>0)
+    participate when `voiced_only=True`.
+
+    Uses a simple pure-numpy DTW (no scipy) so it works in any environment.
+    For large arrays (>10s clips), consider downsampling before calling.
+
+    Args:
+        f0_user:    (T,)  user F0 in Hz (0 = unvoiced)
+        f0_ref:     (T',) reference F0 in Hz (0 = unvoiced), need not match T
+        hop_length: shared hop in samples
+        sr:         sample rate
+        voiced_only: if True, strips unvoiced frames before alignment
+
+    Returns:
+        dict with:
+            dtw_distance:       normalised DTW path cost (cents, lower = better)
+            mean_deviation_cents: mean absolute deviation along path
+            max_deviation_cents:  max absolute deviation along path
+            path_length:        number of (i,j) steps in optimal path
+    """
+    def _to_cents(f0):
+        v = f0[f0 > 0] if voiced_only else f0[f0 > 0]
+        if len(v) < 2:
+            return None
+        mean_hz = np.mean(v)
+        return 1200.0 * np.log2(v / (mean_hz + 1e-10))
+
+    c_user = _to_cents(f0_user)
+    c_ref  = _to_cents(f0_ref)
+
+    if c_user is None or c_ref is None or len(c_user) == 0 or len(c_ref) == 0:
+        return {"dtw_distance": float("nan"), "mean_deviation_cents": float("nan"),
+                "max_deviation_cents": float("nan"), "path_length": 0}
+
+    N, M = len(c_user), len(c_ref)
+
+    # Cost matrix (absolute cents difference)
+    cost = np.abs(c_user[:, None] - c_ref[None, :])  # (N, M)
+
+    # DTW accumulation (standard DP)
+    D = np.full((N, M), np.inf, dtype=np.float64)
+    D[0, 0] = cost[0, 0]
+    for i in range(1, N):
+        D[i, 0] = D[i - 1, 0] + cost[i, 0]
+    for j in range(1, M):
+        D[0, j] = D[0, j - 1] + cost[0, j]
+    for i in range(1, N):
+        for j in range(1, M):
+            D[i, j] = cost[i, j] + min(D[i - 1, j], D[i, j - 1], D[i - 1, j - 1])
+
+    # Traceback to collect deviations
+    i, j = N - 1, M - 1
+    deviations = []
+    path_len = 0
+    while i > 0 or j > 0:
+        deviations.append(cost[i, j])
+        path_len += 1
+        if i == 0:
+            j -= 1
+        elif j == 0:
+            i -= 1
+        else:
+            step = np.argmin([D[i - 1, j - 1], D[i - 1, j], D[i, j - 1]])
+            if step == 0:
+                i -= 1; j -= 1
+            elif step == 1:
+                i -= 1
+            else:
+                j -= 1
+    deviations.append(cost[0, 0])
+    path_len += 1
+
+    deviations = np.array(deviations, dtype=np.float32)
+    normalised = float(D[N - 1, M - 1]) / (path_len + 1e-10)
+
+    return {
+        "dtw_distance": normalised,
+        "mean_deviation_cents": float(np.mean(deviations)),
+        "max_deviation_cents":  float(np.max(deviations)),
+        "path_length": path_len,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Feature Ph — Phrase Aggregation (UX critical)
+# ═══════════════════════════════════════════════════════════════════════
+
+_TECHNIQUE_NAMES = ["vibrato", "breathy", "falsetto", "belt"]
+
+def phrase_aggregate(f0_hz, vad, technique_probs=None, rms_db=None,
+                     sr=SR, hop_length=HOP_LENGTH,
+                     min_gap_frames=15, min_phrase_frames=10):
+    """Segment audio into phrases and compute per-phrase coaching metrics.
+
+    Phrases are defined as voiced regions separated by VAD gaps ≥ `min_gap_frames`
+    (default 15 frames = 150ms at 10ms hop). Short phrases below
+    `min_phrase_frames` are skipped.
+
+    Args:
+        f0_hz:          (T,) per-frame F0 in Hz (0 = unvoiced)
+        vad:            (T,) per-frame VAD probability
+        technique_probs:(T, 4) sigmoid outputs for [vibrato, breathy, falsetto, belt];
+                        or None to skip technique per-phrase means
+        rms_db:         (T,) RMS energy in dBFS; or None to skip dynamics
+        sr:             sample rate
+        hop_length:     hop in samples
+        min_gap_frames: minimum unvoiced gap to split phrases (default = 150ms)
+        min_phrase_frames: minimum phrase duration to report (default = 100ms)
+
+    Returns:
+        list of dicts, one per phrase:
+            start_frame, end_frame, duration_s,
+            f0_mean_hz, f0_std_hz, f0_range_cents,
+            vibrato: {has_vibrato, rate_hz, depth_cents, regularity},
+            technique_means: {vibrato: float, breathy: float, ...} | None,
+            rms_mean_db, rms_arc_db: None if rms_db not provided
+    """
+    hop_s = hop_length / sr
+    voiced = vad > 0.5
+
+    # Find voiced phrase boundaries
+    changes = np.diff(voiced.astype(int), prepend=0, append=0)
+    v_starts = np.where(changes == 1)[0]
+    v_ends   = np.where(changes == -1)[0]
+
+    # Merge phrases separated by gaps smaller than min_gap_frames
+    if len(v_starts) == 0:
+        return []
+
+    merged_starts = [v_starts[0]]
+    merged_ends   = [v_ends[0]]
+    for i in range(1, len(v_starts)):
+        gap = v_starts[i] - merged_ends[-1]
+        if gap < min_gap_frames:
+            merged_ends[-1] = v_ends[i]
+        else:
+            merged_starts.append(v_starts[i])
+            merged_ends.append(v_ends[i])
+
+    phrases = []
+    vib_results = compute_vibrato(f0_hz, sr=sr, hop_length=hop_length)
+    # Index vibrato results by start_frame for O(1) lookup
+    vib_by_start = {r["start_frame"]: r for r in vib_results}
+
+    for ps, pe in zip(merged_starts, merged_ends):
+        if pe - ps < min_phrase_frames:
+            continue
+
+        seg_f0 = f0_hz[ps:pe]
+        voiced_f0 = seg_f0[seg_f0 > 0]
+        duration_s = (pe - ps) * hop_s
+
+        phrase = {
+            "start_frame": int(ps),
+            "end_frame":   int(pe),
+            "duration_s":  float(duration_s),
+            "f0_mean_hz":  float(np.mean(voiced_f0)) if len(voiced_f0) > 0 else float("nan"),
+            "f0_std_hz":   float(np.std(voiced_f0))  if len(voiced_f0) > 1 else float("nan"),
+            "f0_range_cents": float(
+                1200.0 * np.log2((voiced_f0.max() / (voiced_f0.min() + 1e-10)) + 1e-10)
+            ) if len(voiced_f0) > 1 else float("nan"),
+        }
+
+        # Vibrato — find the sub-phrase that overlaps with [ps, pe]
+        # compute_vibrato works on the full f0_hz array; pick matching entry
+        phrase_vib = vib_by_start.get(ps)
+        if phrase_vib is None:
+            # Nearest start within 5 frames (merge may shift boundary slightly)
+            for vr in vib_results:
+                if abs(vr["start_frame"] - ps) <= 5 and vr["end_frame"] <= pe + 5:
+                    phrase_vib = vr
+                    break
+        phrase["vibrato"] = {
+            "has_vibrato": phrase_vib["has_vibrato"] if phrase_vib else False,
+            "rate_hz":     phrase_vib["rate_hz"]    if phrase_vib else None,
+            "depth_cents": phrase_vib["depth_cents"] if phrase_vib else None,
+            "regularity":  phrase_vib["regularity"]  if phrase_vib else None,
+        }
+
+        # Technique means
+        if technique_probs is not None:
+            tp = np.asarray(technique_probs)
+            seg_tech = tp[ps:pe]
+            phrase["technique_means"] = {
+                name: float(np.mean(seg_tech[:, k]))
+                for k, name in enumerate(_TECHNIQUE_NAMES)
+                if k < seg_tech.shape[1]
+            }
+        else:
+            phrase["technique_means"] = None
+
+        # RMS dynamics
+        if rms_db is not None:
+            seg_rms = rms_db[ps:pe]
+            phrase["rms_mean_db"] = float(np.mean(seg_rms))
+            # "arc" = difference between peak (climax) and start/end mean
+            third = max(1, (pe - ps) // 3)
+            rms_start = float(np.mean(seg_rms[:third]))
+            rms_end   = float(np.mean(seg_rms[-third:]))
+            rms_peak  = float(np.max(seg_rms))
+            phrase["rms_arc_db"] = rms_peak - max(rms_start, rms_end)
+        else:
+            phrase["rms_mean_db"] = None
+            phrase["rms_arc_db"]  = None
+
+        phrases.append(phrase)
+
+    return phrases
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Convenience: extract all features at once
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -425,6 +747,9 @@ def extract_all(y, sr=SR, f0_hz=None, vad=None,
     feats['onsets'] = compute_onset_steepness(feats['rms_db'], vad,
                                                hop_s=hop_length / sr)
 
+    # Features 5-7 — Vibrato (per phrase)
+    feats['vibrato_phrases'] = compute_vibrato(f0_hz, sr=sr, hop_length=hop_length)
+
     return feats
 
 
@@ -439,6 +764,11 @@ def summarise(feats, f0_hz=None):
         v = arr[~np.isnan(arr)]
         return float(np.mean(v)) if len(v) > 0 else float('nan')
 
+    # Vibrato summary across all voiced phrases
+    vib_phrases = feats.get('vibrato_phrases', [])
+    vib_phrases_with = [p for p in vib_phrases if p['has_vibrato']]
+    n_phrases = len(vib_phrases)
+
     summary = {
         'rms_mean_db':           vmean(feats['rms_db']),
         'rms_range_db':          float(np.nanmax(feats['rms_db']) -
@@ -452,5 +782,12 @@ def summarise(feats, f0_hz=None):
         'n_onsets':              len(feats['onsets']),
         'onset_steepness_mean':  (float(np.mean([s for _, s in feats['onsets']]))
                                   if feats['onsets'] else float('nan')),
+        'n_voiced_segments':     n_phrases,
+        'vibrato_phrase_frac':   (len(vib_phrases_with) / n_phrases
+                                  if n_phrases > 0 else float('nan')),  # over voiced segments
+        'vibrato_rate_hz_mean':  (float(np.mean([p['rate_hz'] for p in vib_phrases_with]))
+                                  if vib_phrases_with else float('nan')),
+        'vibrato_depth_cents_mean': (float(np.mean([p['depth_cents'] for p in vib_phrases_with]))
+                                     if vib_phrases_with else float('nan')),
     }
     return summary
