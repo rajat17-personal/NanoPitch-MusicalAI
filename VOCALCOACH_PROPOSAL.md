@@ -131,16 +131,15 @@ Each coaching report includes a `population_context` block comparing the user's 
 
 **Problem identified:** SingMOS-Pro does not meaningfully differentiate amateur from professional singing in PopBuTFy — both groups score ~4.8 (ceiling effect). Both groups are studio recordings; MOS measures perceived acoustic quality / naturalness, not singing skill. End users of a vocal coaching app are not expected to have studio microphones, so MOS is not a useful signal for the core coaching task.
 
-**Plan:** Replace SingMOS-Pro with a singing-specific perceptual scorer. Two candidates evaluated:
+**Plan:** Replace SingMOS-Pro with a singing-specific perceptual scorer. Candidate evaluated:
 
 | Model | Size | Output | Amateur/Pro differentiation | Status |
-|---|---|---|---|---|
-| **VocalVerse2 / MuQ** (audioscore) | Small (MuQ encoder + scoring head) | Single aesthetic score 50–99 | Unknown — to be verified on PopBuTFy | Local eval script written: `scripts/score_vocalverse2.py` |
-| **VocalVerse1 / Qwen2-Audio-7B** (qwenaudio) | ~15 GB fp16 + 4 LoRA adapters | 4 scores: Timbre / Breath / Emotion / Technique | Unknown — to be verified | Colab notebook written: `notebooks/VocalVerse1_Colab.ipynb` |
+| --- | --- | --- | --- | --- |
+| **SongEvalGenerator / MuQ** (audioscore) | ~321M (MuQ-large ~300M + head ~21M) | 5 scores: Coherence / Musicality / Memorability / Clarity / Naturalness [1–5] | Poor separation observed on PopBuTFy — same ceiling issue as SingMOS-Pro | Colab cells 7a–7c in `notebooks/VocalVerse1_Colab.ipynb`; local eval in `scripts/score_vocalverse2.py` |
 
-Both models are from Wang et al., *"Singing Timbre Popularity Assessment Based on Multimodal Large Foundation Model"*, ACM MM 2025 ([doi:10.1145/3746027.3758148](https://doi.org/10.1145/3746027.3758148)). Trained on expert-annotated VocalVerse dataset (165 amateur raters + 4 professional vocal experts, 4 dimensions).
+VocalVerse1 (Qwen2-Audio-7B + 4 LoRA adapters, ~15 GB) removed from consideration — model size makes it impractical for any offline or online pipeline. Both SingMOS-Pro and SongEvalGenerator score similarly on PopBuTFy (ceiling effect ~4.8/5 for both amateur and professional), indicating the problem is not the model choice but the lack of skill-discriminative training signal. See *Perceptual Quality Scoring — Extended Options* section for the path forward.
 
-**Next step:** Run both on a PopBuTFy song pair (amateur vs professional) and check whether pro scores consistently exceed amateur scores. If separation is meaningful, integrate the best model as the MOS replacement in the API and population context chart.
+Both SongEvalGenerator and the original VocalVerse2 are from Wang et al., *"Singing Timbre Popularity Assessment Based on Multimodal Large Foundation Model"*, ACM MM 2025 ([doi:10.1145/3746027.3758148](https://doi.org/10.1145/3746027.3758148)).
 
 ---
 
@@ -182,7 +181,7 @@ Several reported metrics use independent measurement paths and can contradict ea
 
 ## Open Questions / Pending
 
-1. **Perceptual scorer:** Run VocalVerse1 (Colab) and VocalVerse2 (local) on PopBuTFy pairs; confirm amateur/pro separation before integrating into API.
+1. **Perceptual scorer:** SingMOS-Pro and SongEvalGenerator both show ceiling effects (~4.8/5) on PopBuTFy — no meaningful amateur/pro separation. VocalVerse1 (7B) removed from consideration. Path forward: contrastive calibration + scoring head on VocalCoach backbone (see *Perceptual Quality Scoring — Extended Options*).
 2. **mF1 gap (probe-mode 0.395 vs joint-best 0.810):** Deeper probe head (`Linear(128→64)→GELU→Linear(64→5)`) + 100 epochs expected to gain 10–15 mF1 points.
 3. **Belt F1=0.000 in probe runs:** Belt is the rarest VocalSet class; pos_weight tuning needed.
 4. **Falsetto coverage:** VocalSet has no falsetto. Requires a new data source or using GTSinger technique clips with cleaned labels.
@@ -304,7 +303,152 @@ SongEvalGenerator   (~21M params)
 - **7b**: Loads the 321M model, defines `lite_score(path)` helper
 - **7c**: Side-by-side comparison table — SongEvalGenerator vs QwenFeat 4-LoRA on the same PopBuTFy clips, with per-clip timing
 
-**Next step:** Run cell 7c on the same `Female1 / my_heart_will_go_on` clips used for the LoRA comparison. If Musicality or Naturalness separates amateur from professional by ≥0.3 points, SongEvalGenerator is a viable drop-in replacement for SingMOS-Pro in `vocalcoach/singmos.py`.
+**Inference overhead vs VocalCoach (offline eval):**
+
+| Model | Params | Relative size | Approx time/clip | Use case |
+| --- | --- | --- | --- | --- |
+| VocalCoach Conformer/TCN | ~450K | 1× | ~5–10 ms | Real-time + offline |
+| SingMOS-Pro (wav2vec2-base head) | ~95M | ~211× | ~1–2 s | Offline only |
+| SongEvalGenerator (MuQ + head) | ~321M | ~713× | ~3–8 s | Offline only |
+| Option B scoring head on VocalCoach | ~450K + ~1K | ~1× | sub-ms extra | Real-time + offline |
+
+SongEvalGenerator is ~713× larger than VocalCoach. For one-time baseline-building across the full PopBuTFy corpus it is acceptable (run once, save JSON). For per-clip coaching feedback it is too heavy — Option B (head on the existing backbone) is the right path there.
+
+**Status:** Both SingMOS-Pro and SongEvalGenerator show the same ceiling effect on PopBuTFy — neither is a useful drop-in without addressing the fundamental training signal problem. The path forward is Option B + contrastive calibration (see ordered plan below).
+
+---
+
+## Implementation Order — Next Steps
+
+Ordered by dependency and impact. Metric Conflicts (noisy probe-mode F0, vibrato classifier disagreement) are in the acoustic feature path and are **independent** of the perceptual scoring track — they do not need to be fixed first.
+
+### Step 1 — Assemble the combined amateur/professional eval dataset (no training required)
+
+Build a reference dataset by combining:
+
+- **Professional side:** `ccmusic-database/acapella` (132 clips, 9-dim expert scores, HuggingFace, CC-BY-NC-ND 4.0)
+- **Amateur side:** PopBuTFy amateur clips (simulated — pro singer performing poorly; best available public option given DAMP/SingEval audio no longer accessible)
+- **Optional:** any karaoke recordings collected from target users (real untrained amateurs — highest ROI if even 50–100 clips available)
+
+Run SingMOS-Pro and SongEvalGenerator on all clips. Save scores to JSON/CSV. This gives a multi-model baseline across a wider skill range than PopBuTFy alone, and will reveal whether the ceiling effect persists on ccmusic's lower-scoring clips (scores as low as 1.25/10 — these are genuine weak singers).
+
+**Deliverable:** `data/combined_eval_baselines.json` and `data/combined_eval_summary.json` with per-clip and per-level statistics from both models.
+
+**Script:** `scripts/build_combined_eval_baselines.py`
+
+```bash
+# Full run (both models, all amateur clips)
+python scripts/build_combined_eval_baselines.py \
+    --popbutfy data/popbutfy \
+    --output   data/combined_eval_baselines.json
+
+# Quick sanity check (50 amateur clips, SingMOS only)
+python scripts/build_combined_eval_baselines.py \
+    --popbutfy data/popbutfy \
+    --no-songevalgen \
+    --max-amateur 50
+```
+
+Requires `QWENFEAT_ROOT` set for SongEvalGenerator. Both models can be disabled independently with `--no-singmos` / `--no-songevalgen`.
+
+---
+
+### Step 2 — Add contrastive calibration to VocalCoach training loop
+
+This teaches VocalCoach itself to assign higher scores to professional clips than amateur clips — making SingMOS a separate model unnecessary for the scoring signal.
+
+**How:** Add a pairwise margin ranking loss alongside the existing pitch/VAD/technique losses:
+
+```python
+# For each (pro_clip, amateur_clip) pair from PopBuTFy:
+ranking_loss = F.margin_ranking_loss(
+    score_pro, score_amateur,
+    target=torch.ones_like(score_pro),  # pro should score higher
+    margin=0.5
+)
+total_loss = pitch_loss + vad_loss + tech_loss + λ * ranking_loss
+```
+
+The backbone is already frozen (probe mode) — this loss trains only the scoring head. `λ` controls how strongly the ranking signal dominates over MOS regression; start at 0.1 and tune.
+
+**Key point:** this does not require absolute MOS labels. Every `(pro, amateur)` pair in PopBuTFy provides free supervision. With 99 songs × 2 singers × N clips per song, there are thousands of valid pairs.
+
+**Deliverable:** Updated training script with ranking loss; re-run probe training on VocalCoach backbone.
+
+---
+
+### Step 3 — Attach lightweight scoring head to VocalCoach backbone (Option B)
+
+Add parallel linear regression heads to the frozen Conformer/TCN backbone — one per quality dimension:
+
+- Overall quality (contrastive-calibrated from Step 2)
+- Pitch accuracy proxy (can use existing `head_pitch` confidence as input)
+- Breath/phrase quality (phrase-level mean energy / regularity from VAD)
+- Timbre (speaker embedding similarity — optional, needs speaker ref)
+
+**Inference overhead:** sub-millisecond for the head itself. Total VocalCoach inference cost unchanged.
+
+**Training data:**
+
+1. Pre-train head on SingMOS-Pro (7,981 clips, 3-dim MOS) — domain adaptation from synthesized to real singing
+2. Fine-tune on ccmusic-database/acapella (132 clips, 9-dim expert scores) — frozen backbone, head only
+3. Contrastive calibration on PopBuTFy pairs (from Step 2)
+
+**Deliverable:** `head_quality` added to `vocalcoach/model.py`; updated `vocalcoach/coach.py` to include quality dimension scores in coaching report.
+
+---
+
+### Step 4 — Replace SingMOS-Pro in the API with the calibrated scoring head
+
+Once Step 3 validates that the head separates amateur from professional meaningfully (target: ≥0.3 point separation on ccmusic low vs high scorers):
+
+- Remove SingMOS-Pro external model call from `vocalcoach/singmos.py`
+- Route quality scores through `head_quality` outputs instead
+- Update population context chart in `VocalCoach_Inference.ipynb` with the new dimensions
+
+**Deliverable:** `vocalcoach/singmos.py` replaced or wrapped; updated coaching report JSON schema.
+
+---
+
+### Not blocking the above (fix later, independently)
+
+- **Metric Conflicts (noisy F0):** RMVPE-based F0 extractor would fix HNR/jitter/shimmer and vibrato detection. Independent of perceptual scoring. Low priority until coaching report quality becomes the bottleneck.
+
+---
+
+## Future Scope — YouTube Cover Dataset
+
+A scalable source of real amateur singing data with implicit professional references:
+
+**Approach:** Collect audio from YouTube covers of 10–15 popular pop songs (e.g. Rolling in the Deep, Hallelujah, Let It Go, Shallow). Label original artist official uploads as **professional** reference; all cover versions as **amateur** proxy. This gives a large, naturalistic amateur corpus without manual labelling.
+
+**Implementation sketch:**
+
+```bash
+pip install yt-dlp demucs
+
+# Download original (professional reference)
+yt-dlp -x --audio-format wav -o "data/yt_covers/pro/%(title)s.%(ext)s" "<official video URL>"
+
+# Download covers playlist (amateur)
+yt-dlp -x --audio-format wav -o "data/yt_covers/amateur/%(title)s_%(id)s.%(ext)s" "<playlist URL>"
+
+# Separate vocals from backing track before scoring
+python -m demucs --two-stems=vocals data/yt_covers/amateur/*.wav
+```
+
+**Key design decisions before starting:**
+
+- Vocal isolation via `demucs` (two-stem: vocals + accompaniment) is required before running SingMOS or SongEvalGenerator — both models expect dry vocal audio
+- Song selection: pick songs with many covers (100+ results on YouTube) and clear original artist recordings
+- Quality filtering: discard clips shorter than 30s or with very low audio bitrate
+
+**Why this is future scope and not current priority:** The existing PopBuTFy + ccmusic + VocalSet combination covers the controlled skill range well enough for Steps 1–3. YouTube scraping adds breadth but not controlled pairs — the per-song original/cover pairing is weaker supervision than PopBuTFy's same-singer amateur/professional pairs. Revisit once the scoring head (Step 3) needs more training data to generalise.
+
+- **mF1 gap (probe 0.395 vs joint 0.810):** Deeper probe head + more epochs. Independent task.
+- **Belt F1=0.000:** pos_weight tuning. Independent.
+- **Falsetto coverage:** Needs new data source. Independent.
+- **Live causal TCN retrain:** Independent of quality scoring track.
 
 ---
 
