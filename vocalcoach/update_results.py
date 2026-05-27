@@ -55,6 +55,11 @@ TRAIN_DEFAULTS = {
     "vad_pos_weight": 2.3, "technique_clip_weight": 1.0,
     "technique_pos_weights": None,
     "pitch_sigma": 1.2,
+    # Quality scoring head
+    "quality_variant": 0,
+    "quality_pairs_npz": None, "quality_mse_npz": None, "quality_ccmusic_npz": None,
+    "ranking_margin": 0.5, "w_ranking": 1.0, "w_quality_mse": 1.0,
+    "quality_epochs_mse": 30,
     # Augmentation
     "augment": "none",
     "snr_range": [-10.0, 30.0], "p_clean": 0.0, "snr_bias": 1.0,
@@ -81,6 +86,9 @@ INTERESTING_ARGS = [
     "vad_pos_weight", "technique_clip_weight",
     "technique_pos_weights",
     "pitch_sigma",
+    # Quality scoring head (NPZ paths excluded — shown as data sources)
+    "quality_variant", "ranking_margin", "w_ranking", "w_quality_mse",
+    "quality_epochs_mse",
     # Augmentation
     "augment", "snr_range", "p_clean", "snr_bias",
     "freq_mask_param", "n_freq_masks", "time_mask_param", "n_time_masks",
@@ -660,6 +668,11 @@ def main():
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     ckpt_args = ckpt.get("args", {}) or {}
+
+    if ckpt_args.get("quality_variant", 0) > 0:
+        print(f"[note] quality_variant={ckpt_args['quality_variant']} checkpoint — "
+              "pitch/technique heads are frozen; eval metrics reflect the base checkpoint. "
+              "Use --note to annotate the quality variant in the results table.")
 
     # Resolve paths — prefer CLI args, fall back to what was saved in checkpoint.
     data_dir_abs = os.path.abspath(args.data_dir)

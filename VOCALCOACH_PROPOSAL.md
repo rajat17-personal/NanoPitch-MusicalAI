@@ -318,46 +318,17 @@ SongEvalGenerator is ~713× larger than VocalCoach. For one-time baseline-buildi
 
 ---
 
-## Implementation Order — Next Steps
+## Scoring Head Variants — Implementation Plan
 
-Ordered by dependency and impact. Metric Conflicts (noisy probe-mode F0, vibrato classifier disagreement) are in the acoustic feature path and are **independent** of the perceptual scoring track — they do not need to be fixed first.
+All three variants share the same frozen VocalCoach Conformer backbone (pitch + VAD + technique heads frozen, probe-mode checkpoint Run 19). Only `head_quality` differs across variants. Implement in order: Variant 1 is the baseline, Variant 2 is the multi-dimension extension, Variant 3 is an alternative initialization strategy that can be combined with either of the first two.
 
-### Step 1 — Assemble the combined amateur/professional eval dataset (no training required)
-
-Build a reference dataset by combining:
-
-- **Professional side:** `ccmusic-database/acapella` (132 clips, 9-dim expert scores, HuggingFace, CC-BY-NC-ND 4.0)
-- **Amateur side:** PopBuTFy amateur clips (simulated — pro singer performing poorly; best available public option given DAMP/SingEval audio no longer accessible)
-- **Optional:** any karaoke recordings collected from target users (real untrained amateurs — highest ROI if even 50–100 clips available)
-
-Run SingMOS-Pro and SongEvalGenerator on all clips. Save scores to JSON/CSV. This gives a multi-model baseline across a wider skill range than PopBuTFy alone, and will reveal whether the ceiling effect persists on ccmusic's lower-scoring clips (scores as low as 1.25/10 — these are genuine weak singers).
-
-**Deliverable:** `data/combined_eval_baselines.json` and `data/combined_eval_summary.json` with per-clip and per-level statistics from both models.
-
-**Script:** `scripts/build_combined_eval_baselines.py`
-
-```bash
-# Full run (both models, all amateur clips)
-python scripts/build_combined_eval_baselines.py \
-    --popbutfy data/popbutfy \
-    --output   data/combined_eval_baselines.json
-
-# Quick sanity check (50 amateur clips, SingMOS only)
-python scripts/build_combined_eval_baselines.py \
-    --popbutfy data/popbutfy \
-    --no-songevalgen \
-    --max-amateur 50
-```
-
-Requires `QWENFEAT_ROOT` set for SongEvalGenerator. Both models can be disabled independently with `--no-singmos` / `--no-songevalgen`.
+Metric Conflicts (noisy probe-mode F0, vibrato classifier disagreement) are in the acoustic feature path and are **independent** of this scoring head track — they do not need to be fixed first.
 
 ---
 
-### Step 2 — Add contrastive calibration to VocalCoach training loop
+### Variant 1 — Contrastive scoring head on PopBuTFy pairs (baseline, implement first)
 
-This teaches VocalCoach itself to assign higher scores to professional clips than amateur clips — making SingMOS a separate model unnecessary for the scoring signal.
-
-**How:** Add a pairwise margin ranking loss alongside the existing pitch/VAD/technique losses:
+**Training objective:** Pairwise margin ranking loss using PopBuTFy same-singer amateur/professional pairs. No absolute MOS labels required — every `(pro, amateur)` pair from the same singer on the same song provides free supervision. The head must learn to rank `score(pro) > score(amateur)` by at least `margin`.
 
 ```python
 # For each (pro_clip, amateur_clip) pair from PopBuTFy:
@@ -366,43 +337,136 @@ ranking_loss = F.margin_ranking_loss(
     target=torch.ones_like(score_pro),  # pro should score higher
     margin=0.5
 )
-total_loss = pitch_loss + vad_loss + tech_loss + λ * ranking_loss
 ```
 
-The backbone is already frozen (probe mode) — this loss trains only the scoring head. `λ` controls how strongly the ranking signal dominates over MOS regression; start at 0.1 and tune.
+Backbone is frozen (probe mode). Only `head_quality` (a small linear layer: `hidden_dim → 1`) is trained. Output scale is arbitrary — normalize to 0–100 at display time.
 
-**Key point:** this does not require absolute MOS labels. Every `(pro, amateur)` pair in PopBuTFy provides free supervision. With 99 songs × 2 singers × N clips per song, there are thousands of valid pairs.
+**Why PopBuTFy for contrastive:** Same singer, same song, different skill level — recording quality, singer identity, and song difficulty are all controlled out. This is the cleanest possible pairwise signal. AudioScore's validated +0.36 pro−amateur delta on these pairs (vs SingMOS-Pro's inverted −0.05) confirms the signal is real.
 
-**Deliverable:** Updated training script with ranking loss; re-run probe training on VocalCoach backbone.
+**Training data:** ~28K PopBuTFy clips → thousands of valid `(pro, amateur)` pairs per song.
 
----
-
-### Step 3 — Attach lightweight scoring head to VocalCoach backbone (Option B)
-
-Add parallel linear regression heads to the frozen Conformer/TCN backbone — one per quality dimension:
-
-- Overall quality (contrastive-calibrated from Step 2)
-- Pitch accuracy proxy (can use existing `head_pitch` confidence as input)
-- Breath/phrase quality (phrase-level mean energy / regularity from VAD)
-- Timbre (speaker embedding similarity — optional, needs speaker ref)
-
-**Inference overhead:** sub-millisecond for the head itself. Total VocalCoach inference cost unchanged.
-
-**Training data:**
-
-1. Pre-train head on SingMOS-Pro (7,981 clips, 3-dim MOS) — domain adaptation from synthesized to real singing
-2. Fine-tune on ccmusic-database/acapella (132 clips, 9-dim expert scores) — frozen backbone, head only
-3. Contrastive calibration on PopBuTFy pairs (from Step 2)
-
-**Deliverable:** `head_quality` added to `vocalcoach/model.py`; updated `vocalcoach/coach.py` to include quality dimension scores in coaching report.
+**Deliverable:** `head_quality` added to `vocalcoach/model.py`; training script with ranking loss; validation: check pro−amateur delta on held-out PopBuTFy clips and ccmusic low vs high scorers.
 
 ---
 
-### Step 4 — Replace SingMOS-Pro in the API with the calibrated scoring head
+### Variant 2 — Multi-dimension scoring head supervised by ccmusic expert labels (implement second)
 
-Once Step 3 validates that the head separates amateur from professional meaningfully (target: ≥0.3 point separation on ccmusic low vs high scorers):
+**What changes vs Variant 1:** Instead of a single scalar output trained contrastively, `head_quality` outputs **multiple dimensions** corresponding to ccmusic's 9 expert-rated categories: Pitch, Rhythm, Timbre, Breath Control, Vibrato, Dynamic, Pronunciation, Vocal Range, Overall.
 
-- Remove SingMOS-Pro external model call from `vocalcoach/singmos.py`
+**Why this is meaningful:** AudioScore's per-dimension Pearson r values (pitch +0.659, rhythm +0.627, vocal_range +0.623, timbre +0.599) show that the VocalCoach backbone already encodes enough information to predict each dimension independently — the head just needs to be trained to separate them. A multi-dimension output maps directly to the radar-chart display in the coaching report.
+
+**Important clarification on what the r values mean and do not mean:** AudioScore outputs **one single scalar** per clip. The per-dimension r values are computed by taking AudioScore's scalar output across all 132 ccmusic clips and correlating it against each of ccmusic's 9 expert columns separately (e.g., `pearsonr(audioscore_scores, ccmusic_pitch_labels)` → r=+0.659). These r values are *validation evidence* that the backbone representations co-vary with each expert dimension — they do not mean AudioScore can decompose its output into pitch/rhythm/timbre numbers. For Variant 2, ccmusic's 9 expert columns become 9 separate MSE regression targets for `head_quality` directly. AudioScore is not involved in Variant 2's training signal.
+
+**Training pipeline:**
+
+1. Pre-train `head_quality` (9 outputs) on **SingMOS-Pro** (7,981 clips, 3-dim MOS: Lyrics/Melody/Overall) — establishes MOS-scale calibration with large N; the 3 MOS dims supervise a subset of the 9 output neurons (Overall, Breath/Melody proxy, Timbre/Naturalness proxy).
+2. Fine-tune on **ccmusic-database/acapella** (132 clips, 9-dim expert scores, CC-BY-NC-ND 4.0) — maps all 9 output dimensions directly to expert labels via MSE. 132 clips is at the edge of the linear probe regime; SingMOS-Pro pre-training is essential here.
+3. Contrastive calibration on **PopBuTFy pairs** (same as Variant 1) — anchors the Overall dimension's absolute scale to real skill separation.
+
+**Data constraint note:** 132 clips for 9 regression targets is tight. Use L2 regularization on head weights and early stopping on a ccmusic held-out split (10–15 clips). Pre-training on SingMOS-Pro is not optional.
+
+**Deliverable:** `head_quality` with 9 outputs; per-dimension scores in coaching report JSON; radar chart updated in `VocalCoach_Inference.ipynb`.
+
+---
+
+### Variant 4 — Note Segmentation Head (note-level pitch accuracy from learned head)
+
+**What this adds:** A new frame-level head `head_note` that predicts note onset and offset probabilities at every time step, trained jointly with the pitch and VAD heads (not with technique). At inference the model produces note boundaries directly from audio — no post-hoc signal processing needed.
+
+**Training data:** `data/annotated_vocalset/note_train.npz` — 824 VocalSet clips, 18,412 annotated notes, 755/824 clips with note boundaries. Derived from the Annotated VocalSet dataset (Kim et al.) using per-frame onset/offset markers.
+
+**Why not GTSinger for this:** GTSinger's technique NPZ (`technique_train.npz`) has no note-level timing annotations — only clip-level technique labels and RMVPE-derived F0. The 9,601 GTSinger clips provide pitch/VAD supervision but no note segmentation labels. Only the Annotated VocalSet subset (824 train clips) provides onset/offset supervision.
+
+**Is 824 clips enough to converge?** Probably yes for onset detection, with caveats:
+
+- 18,412 notes across ~150 min of audio is a reasonable scale for a thin binary classification head on top of frozen conformer features
+- VocalSet is controlled (isolated vocal exercises, clean studio audio) — onsets are clean and consistent; the head won't fight background noise during training
+- The frozen backbone already encodes temporal dynamics (conformer global attention) — the head only needs to learn to read onset signatures from existing representations, not learn them from scratch
+- The real risk is generalisation: VocalSet exercises have regular, evenly-spaced notes; real singing has irregular phrasing. Plan to validate on a held-out VocalSet split (female4/female8/male2/male4 test set, ~200 clips) before deploying
+
+**Architecture:** Two thin output heads sharing backbone features with pitch/VAD:
+
+```python
+head_note_onset  = nn.Linear(hidden_dim, 1)   # P(onset at frame t)
+head_note_offset = nn.Linear(hidden_dim, 1)   # P(offset at frame t)
+```
+
+Training loss: binary cross-entropy on onset/offset frames (same supervision source as VAD). Note frames are sparse (~1–2% of frames are onsets) — use `pos_weight` tuning as with technique head.
+
+**Training:** Joint with pitch/VAD in Stage 1. The backbone is **not** frozen for this head — note segmentation benefits from backbone co-adaptation with pitch, since onset correlates with F0 onset transients. Add `--w-note` weight arg (recommend starting at 0.5 to avoid dominating pitch loss).
+
+**What this enables at inference — note-level coaching metrics without any extra compute:**
+
+| Metric | How computed | What it catches that frame-level RPA misses |
+| --- | --- | --- |
+| **Note-level pitch accuracy** | For each predicted note segment, take median F0; compare to nearest MIDI pitch within 100 cents | Singer who overshoots onset then corrects — frame RPA looks fine, note accuracy is low |
+| **Intonation drift (cents)** | Median(predicted F0) − nearest_MIDI per note, averaged | Systematic flat/sharp tendency per key or phrase |
+| **Pitch stability within note** | Std dev of F0 within predicted note window | Distinguishes intentional vibrato from unsteady pitch; quantifies wobble |
+| **Attack speed** | Frames from predicted onset until F0 reaches ±50¢ of target | Measures how cleanly the singer "finds" the note; coaches note preparation |
+
+**Comparison to post-hoc signal processing:** Frame-level RPA already reports pitch accuracy across voiced frames. The key difference is segmentation: post-hoc note finding (peak-picking on VAD gaps, autocorrelation-based methods) is noisy on real singing with vibrato and glides. A learned onset detector trained on annotated note boundaries should give cleaner note segments, making per-note statistics more reliable — especially `attack speed` and `intonation drift`, which require accurate note start times.
+
+**Training command (Stage 1 with note head, run after extractAnnotatedVocalSet):**
+
+```bash
+python vocalcoach/train.py \
+    --data-dir        data \
+    --technique-dirs  data/vocalset/technique_train.npz \
+                      data/gtsinger_technique/technique_train.npz \
+                      data/annotated_vocalset/note_train.npz \
+    --arch            conformer --causal false \
+    --seq-len         600 --lr 1e-3 \
+    --w-vad 0.05 --w-pitch 2.0 --pitch-sigma 0.8 --w-note 0.5 \
+    --augment noise specaugment \
+    --epochs 120 --eval-every 5 --patience 30 \
+    --ckpt-dir checkpoints/stage1_pitch_note \
+    --run-name stage1_conformer_note_head
+```
+
+**Deliverable:** `head_note_onset` + `head_note_offset` in `model.py`; note-level metrics in `evaluate.py`; per-note accuracy, drift, stability, and attack speed in coaching report JSON.
+
+---
+
+### Variant 3 — Scalar MSE distillation from AudioScore as initialization (alternative to contrastive pre-training)
+
+**What this is:** Instead of starting `head_quality` from random weights, pre-train it via MSE regression against AudioScore's scalar output on a large scored corpus, then fine-tune with contrastive ranking (as in Variant 1 or 2). This is an **initialization strategy**, not a standalone variant — it replaces the SingMOS-Pro pre-training step.
+
+**Why not PopBuTFy for scalar distillation:** AudioScore's absolute scale on PopBuTFy clips is uncalibrated — the pro−amateur gap is only +0.36 on a 1–5 scale, which is weak regression signal. MSE on poorly-separated values produces a head that learns to output ~3.5 for everything.
+
+**Better datasets for scalar distillation:**
+
+| Dataset | N clips | AudioScore scores available | Human MOS available | Notes |
+| --- | --- | --- | --- | --- |
+| **SingMOS-Pro** (TangRain) | 7,981 | ✅ `data/singmos_pro_seg_scores.json` | ✅ `score.json` in HF snapshot | Best option — large N, human MOS ground truth, AudioScore already correlated at r=+0.301 vs GT clips |
+| **ccmusic-database/acapella** | 132 | ✅ `data/combined_eval_baselines.json` | ✅ 9-dim expert scores | Small but highest-quality labels; use for fine-tune not pre-train |
+| **Combined** | ~8K | ✅ both cached | ✅ both available | Pre-train on SingMOS-Pro, fine-tune on ccmusic |
+
+**Why SingMOS-Pro works for this:** AudioScore r=+0.301 vs human MOS on GT (real singer) clips means the model's scalar output is meaningfully correlated with perceived singing quality at population scale. Pre-training `head_quality` to match AudioScore's output on these 7,981 clips gives the head a calibrated starting point before contrastive fine-tuning on PopBuTFy.
+
+**Recommended combined pipeline (Variant 3 + Variant 1 or 2):**
+
+```text
+1. MSE pre-train head_quality on SingMOS-Pro
+   → target: AudioScore scalar scores (data/singmos_pro_seg_scores.json)
+   → loss: MSE(head_output, audioscore_score)
+
+2. Fine-tune on ccmusic (Variant 2 only)
+   → target: 9-dim expert scores
+   → loss: MSE per dimension
+
+3. Contrastive calibration on PopBuTFy pairs
+   → loss: margin_ranking_loss(score_pro, score_amateur, margin=0.5)
+```
+
+**Deliverable:** Modified training script with 3-stage pipeline; ablation comparing random-init contrastive (Variant 1) vs distillation-init contrastive (Variant 3 + 1) on ccmusic Pearson r and PopBuTFy pro−amateur delta.
+
+---
+
+### Replacing SingMOS-Pro in the API
+
+Once any variant validates meaningful amateur/professional separation (target: ≥0.3 point gap on ccmusic low vs high scorers, correct direction on PopBuTFy pairs):
+
+- Remove external AudioScore/SingMOS-Pro model call from `vocalcoach/singmos.py`
 - Route quality scores through `head_quality` outputs instead
 - Update population context chart in `VocalCoach_Inference.ipynb` with the new dimensions
 

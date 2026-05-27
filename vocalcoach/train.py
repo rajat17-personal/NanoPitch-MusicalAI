@@ -7,9 +7,8 @@ Trains VocalCoachTCN or VocalCoachConformer for multi-task singing analysis:
   2. Pitch posteriorgram — what pitch is being sung? (decoded via Viterbi)
   3. Technique classification — vibrato / breathy / falsetto / belt / straight
      (multi-label sigmoid, not mutually exclusive)
-
-Phase 1 focus: non-causal (causal=False) models for offline post-session analysis.
-Phase 4 stretch: retrain with causal=True for ONNX Runtime Web streaming.
+  4. Quality scoring head — singing quality score(s) via frozen backbone
+     (Variants 1 / 2 / 3 — see VOCALCOACH_PROPOSAL.md)
 
 Data layout (NPZ files)
 -----------------------
@@ -34,29 +33,68 @@ supported and can be mixed via --data-dirs:
     vad:     (N, T)
     snr:     (N,)
 
+Quality scoring variants (--quality-variant):
+  1  Scalar contrastive head trained on PopBuTFy same-singer pairs.
+     Requires --popbutfy-dir and --baselines-json.
+     Uses margin ranking loss: score(pro) > score(amateur) by --ranking-margin.
+
+  2  Multi-dim head (9 outputs) trained on ccmusic expert labels (MSE) +
+     optional SingMOS-Pro pretraining (MSE on AudioScore pseudo-labels) +
+     contrastive calibration on PopBuTFy pairs.
+     Requires --ccmusic-wavs-dir and --baselines-json.
+     Optional: --singmos-scores-json for Stage 1 pretraining.
+
+  3  Scalar head with MSE distillation from AudioScore on SingMOS-Pro clips,
+     followed by contrastive calibration on PopBuTFy pairs.
+     Requires --singmos-scores-json and --popbutfy-dir and --baselines-json.
+
+  All variants: --probe-mode is required (backbone frozen; only head_quality trains).
+  Combine with --resume pointing to a trained pitch+technique checkpoint.
+
 Usage
 -----
-# Arch A — TCN, non-causal (Phase 1 Experiment A)
-python vocalcoach/train.py \\
-    --arch tcn --causal false \\
-    --data-dir data \\
-    --technique-dir data/vocalset \\
-    --output-dir vocalcoach/runs/tcn_noncausal
-
-# Arch B — Conformer, non-causal (Phase 1 Experiment B)
+# Train pitch + VAD (Arch B — Conformer, non-causal)
 python vocalcoach/train.py \\
     --arch conformer --causal false \\
     --data-dir data \\
-    --technique-dir data/vocalset \\
+    --technique-dirs data/vocalset \\
     --output-dir vocalcoach/runs/conformer_noncausal
 
-# Resume from checkpoint
+# Prepare quality NPZs first (run once):
+#   python scripts/prepareQualityData.py --popbutfy-dir data/popbutfy \
+#       --baselines-json data/combined_eval_baselines.json \
+#       --output-dir data/quality
+#   (add --ccmusic-wavs-dir / --singmos-scores-json for Variants 2/3)
+
+# Train quality head — Variant 1 (contrastive, scalar)
 python vocalcoach/train.py \\
-    --arch tcn --causal false \\
-    --data-dir data \\
-    --technique-dir data/vocalset \\
-    --output-dir vocalcoach/runs/tcn_noncausal \\
-    --resume vocalcoach/runs/tcn_noncausal/checkpoints/epoch_010.pth
+    --arch conformer --causal false \\
+    --quality-variant 1 \\
+    --probe-mode \\
+    --resume vocalcoach/runs/conformer_probe_technique/checkpoints/best_metric.pth \\
+    --quality-pairs-npz data/quality/quality_pairs.npz \\
+    --output-dir vocalcoach/runs/conformer_quality_v1
+
+# Train quality head — Variant 2 (multi-dim, ccmusic + SingMOS-Pro + contrastive)
+python vocalcoach/train.py \\
+    --arch conformer --causal false \\
+    --quality-variant 2 \\
+    --probe-mode \\
+    --resume vocalcoach/runs/conformer_probe_technique/checkpoints/best_metric.pth \\
+    --quality-pairs-npz   data/quality/quality_pairs.npz \\
+    --quality-ccmusic-npz data/quality/quality_ccmusic.npz \\
+    --quality-mse-npz     data/quality/quality_mse.npz \\
+    --output-dir vocalcoach/runs/conformer_quality_v2
+
+# Train quality head — Variant 3 (MSE distil from AudioScore + contrastive)
+python vocalcoach/train.py \\
+    --arch conformer --causal false \\
+    --quality-variant 3 \\
+    --probe-mode \\
+    --resume vocalcoach/runs/conformer_probe_technique/checkpoints/best_metric.pth \\
+    --quality-pairs-npz data/quality/quality_pairs.npz \\
+    --quality-mse-npz   data/quality/quality_mse.npz \\
+    --output-dir vocalcoach/runs/conformer_quality_v3
 
 Monitor with TensorBoard:
     tensorboard --logdir vocalcoach/runs
@@ -119,8 +157,11 @@ parser.add_argument("--causal", type=str, default="false",
 parser.add_argument("--hidden", type=int, default=None,
                     help="hidden dimension (default: 128 for TCN, 64 for Conformer)")
 parser.add_argument("--n-blocks", type=int, default=None,
-                    help="number of TCN blocks or Conformer layers "
-                         "(default: 8 for TCN, 4 for Conformer)")
+                    help="number of TCN blocks (default: 8 for TCN); ignored for Conformer — use --n-layers instead")
+parser.add_argument("--n-layers", type=int, default=None,
+                    help="number of Conformer blocks (default: 4); Conformer only")
+parser.add_argument("--n-heads", type=int, default=None,
+                    help="number of attention heads for Conformer (default: 4); must divide --hidden evenly")
 parser.add_argument("--deep-technique-head", action="store_true",
                     help="replace the single Linear technique head with a 2-layer MLP "
                          "(Linear→GELU→Dropout→Linear). Recommended with --probe-mode "
@@ -139,6 +180,12 @@ parser.add_argument("--device", type=str, default="cuda",
 parser.add_argument("--epochs", type=int, default=100)
 parser.add_argument("--batch-size", type=int, default=32)
 parser.add_argument("--lr", type=float, default=3e-4)
+parser.add_argument("--lr-backbone", type=float, default=None,
+                    help="separate learning rate for backbone parameters. "
+                         "When set, backbone uses this LR and all heads use --lr. "
+                         "Default None = all parameters share --lr (single-group behavior). "
+                         "Typical use: --lr 3e-4 --lr-backbone 3e-5 to let the "
+                         "technique head learn faster while the backbone shifts slowly.")
 parser.add_argument("--seq-len", type=int, default=300,
                     help="training clip length in frames (300 = 3 seconds)")
 parser.add_argument("--num-workers", type=int, default=2)
@@ -154,6 +201,19 @@ parser.add_argument("--w-pitch", type=float, default=1.0,
 parser.add_argument("--w-technique", type=float, default=2.0,
                     help="weight for technique classification loss (multi-label BCE). "
                          "Higher than pitch/VAD because technique labels are sparse.")
+parser.add_argument("--contrastive-technique", action="store_true", default=False,
+                    help="add supervised contrastive (SupCon) loss on technique embeddings "
+                         "alongside the standard BCE classification loss. Clips with the "
+                         "same technique label are pulled together; different labels are "
+                         "pushed apart. Requires --technique-dirs. "
+                         "Controlled by --w-contrastive-technique and --contrastive-temp.")
+parser.add_argument("--w-contrastive-technique", type=float, default=0.5,
+                    help="weight for the technique SupCon loss term (added to --w-technique * BCE). "
+                         "Default 0.5. Only active when --contrastive-technique is set.")
+parser.add_argument("--contrastive-temp", type=float, default=0.07,
+                    help="temperature for SupCon loss (shared by technique and future quality "
+                         "contrastive variants). Lower = sharper distribution. "
+                         "Default 0.07 (SimCLR / SupCon paper default).")
 
 # VAD loss
 parser.add_argument("--vad-pos-weight", type=float, default=2.3,
@@ -176,7 +236,7 @@ parser.add_argument("--technique-pos-weights", type=float, nargs=5,
                          "  VocalSet + GTSinger (default):      2.9  4.2  1.0  4.0  1.9\n"
                          "  (inf = class absent; set to 1.0 to ignore that class)")
 
-# Backbone freeze (Option B — stop technique gradients reaching backbone)
+# Backbone freeze
 parser.add_argument("--freeze-backbone-epochs", type=int, default=0,
                     help="freeze backbone weights for this many epochs after resuming, "
                          "so only the technique head trains. Backbone unfreezes after N epochs "
@@ -184,12 +244,12 @@ parser.add_argument("--freeze-backbone-epochs", type=int, default=0,
                          "Rule of thumb: 20-30 epochs of frozen technique head, then unfreeze.")
 parser.add_argument("--probe-mode", action="store_true",
                     help="MERT-style linear probing: freeze backbone AND pitch/VAD heads forever. "
-                         "Only head_technique is trainable for the entire run. "
-                         "Use with --resume from a pitch-only checkpoint (e.g. Run 4). "
-                         "Pitch/VAD heads never see technique data — zero distribution drift. "
+                         "When --quality-variant is set, also freezes head_technique — only "
+                         "head_quality trains. When not set, only head_technique trains. "
+                         "Use with --resume from a trained pitch+technique checkpoint. "
                          "Incompatible with --freeze-backbone-epochs.")
 
-# Curriculum training (Option 3 — phase loss weights)
+# Curriculum training
 parser.add_argument("--curriculum", action="store_true",
                     help="Enable curriculum training: technique loss weight is zeroed "
                          "for the first --curriculum-warmup epochs, then linearly ramped "
@@ -203,6 +263,37 @@ parser.add_argument("--curriculum-ramp", type=int, default=10,
                     help="epochs over which w_technique linearly ramps from 0 to its "
                          "target value (--curriculum only).")
 
+# ── Quality scoring head ──────────────────────────────────────────────────────
+parser.add_argument("--quality-variant", type=int, default=0,
+                    choices=[0, 1, 2, 3],
+                    help="Quality head training variant (0 = disabled). "
+                         "Pre-extract NPZs with scripts/prepareQualityData.py first. "
+                         "1: scalar contrastive on PopBuTFy pairs (--quality-pairs-npz). "
+                         "2: 9-dim MSE on ccmusic + SingMOS-Pro + contrastive "
+                         "(all three --quality-*-npz flags). "
+                         "3: scalar MSE distil + contrastive "
+                         "(--quality-mse-npz + --quality-pairs-npz). "
+                         "All variants require --probe-mode and --resume.")
+parser.add_argument("--quality-pairs-npz", type=str, default=None,
+                    help="path to quality_pairs.npz produced by prepareQualityData.py. "
+                         "Required for all quality variants (contrastive stage).")
+parser.add_argument("--quality-mse-npz", type=str, default=None,
+                    help="path to quality_mse.npz (SingMOS-Pro AudioScore scalars). "
+                         "Required for --quality-variant 2 and 3.")
+parser.add_argument("--quality-ccmusic-npz", type=str, default=None,
+                    help="path to quality_ccmusic.npz (ccmusic 9-dim expert scores). "
+                         "Required for --quality-variant 2.")
+parser.add_argument("--ranking-margin", type=float, default=0.5,
+                    help="margin for pairwise ranking loss: score(pro) - score(amateur) > margin. "
+                         "Larger values demand clearer separation.")
+parser.add_argument("--w-ranking", type=float, default=1.0,
+                    help="weight for contrastive ranking loss relative to other quality losses.")
+parser.add_argument("--w-quality-mse", type=float, default=1.0,
+                    help="weight for MSE quality regression loss (Variants 2 and 3).")
+parser.add_argument("--quality-epochs-mse", type=int, default=30,
+                    help="epochs to run MSE pretraining before switching to contrastive "
+                         "(Variants 2 and 3). After this, both MSE and ranking losses are active.")
+
 # Pitch supervision
 parser.add_argument("--pitch-sigma", type=float, default=1.2,
                     help="Gaussian sigma (bins) for pitch posteriorgram target")
@@ -213,8 +304,15 @@ parser.add_argument("--eval-every", type=int, default=5,
 
 # Early stopping
 parser.add_argument("--patience", type=int, default=0,
-                    help="stop if macro technique F1 does not improve for N epochs "
+                    help="stop if best metric does not improve for N epochs "
                          "(0 = disabled)")
+parser.add_argument("--metric-vdr-weight", type=float, default=1.0,
+                    help="relative weight of VDR_clean vs F1/RPA in the compound "
+                         "checkpoint metric: score = primary + w * vdr_clean. "
+                         "Default 1.0 = equal additive weight. "
+                         "Increase (e.g. 2.0) to penalize VDR regression more heavily; "
+                         "decrease (e.g. 0.5) to prioritize F1/RPA; "
+                         "0.0 = track F1/RPA only.")
 
 # Gradient clipping
 parser.add_argument("--grad-clip", type=float, default=5.0)
@@ -364,6 +462,193 @@ class TechniqueDataset(Dataset):
         return mel, f0, vad, technique, has_technique
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Quality scoring datasets  (NPZ-backed — pre-extracted by prepareQualityData.py)
+# ═══════════════════════════════════════════════════════════════════════
+
+class MseQualityDataset(Dataset):
+    """Scalar AudioScore targets from quality_mse.npz (Variants 2 and 3 Stage 1).
+
+    NPZ schema (produced by scripts/prepareQualityData.py) — flat layout:
+      mel:     (total_frames, 40)  float16  — concatenated full clips
+      scores:  (n_clips,)          float32  — one scalar per clip
+      lengths: (n_clips,)          int32
+
+    __getitem__ samples a random seq_len window from a random clip, matching
+    the PitchVADDataset pattern so seq_len changes in train.py take effect.
+    """
+
+    def __init__(self, npz_path, seq_len=300):
+        self.seq_len = seq_len
+        data = np.load(npz_path, allow_pickle=True)
+        self.mel    = data['mel']                           # (total_frames, 40) float16
+        self.scores = data['scores'].astype(np.float32)    # (n_clips,)
+        lengths     = data['lengths']
+
+        self.segments = []
+        offset = 0
+        for clip_idx, length in enumerate(lengths):
+            length = int(length)
+            if length >= seq_len:
+                self.segments.append((offset, offset + length, clip_idx))
+            offset += length
+
+        self.rng = np.random.default_rng()
+        print(f"MseQualityDataset: {len(lengths)} clips "
+              f"({len(self.segments)} usable ≥{seq_len} frames) from {npz_path}")
+
+    def __len__(self):
+        return len(self.segments) * 5   # multiple passes per clip per epoch
+
+    def __getitem__(self, _):
+        s, e, clip_idx = self.segments[self.rng.integers(len(self.segments))]
+        t0 = int(self.rng.integers(0, e - s - self.seq_len + 1)) + s
+        mel = self.mel[t0:t0 + self.seq_len].astype(np.float32)
+        return mel, self.scores[clip_idx]
+
+
+class CcmusicQualityDataset(Dataset):
+    """9-dim expert score targets from quality_ccmusic.npz (Variant 2 Stage 2).
+
+    NPZ schema (produced by scripts/prepareQualityData.py) — flat layout:
+      mel:     (total_frames, 40)  float16
+      scores:  (n_clips, 9)        float32  — CCMUSIC_DIMS order
+      lengths: (n_clips,)          int32
+
+    Uses a higher repeat multiplier (×20) since ccmusic has only 132 clips —
+    each epoch draws many random windows from each clip.
+    """
+
+    def __init__(self, npz_path, seq_len=300):
+        self.seq_len = seq_len
+        data = np.load(npz_path, allow_pickle=True)
+        self.mel    = data['mel']                            # (total_frames, 40) float16
+        self.scores = data['scores'].astype(np.float32)     # (n_clips, 9)
+        lengths     = data['lengths']
+
+        self.segments = []
+        offset = 0
+        for clip_idx, length in enumerate(lengths):
+            length = int(length)
+            if length >= seq_len:
+                self.segments.append((offset, offset + length, clip_idx))
+            offset += length
+
+        self.rng = np.random.default_rng()
+        print(f"CcmusicQualityDataset: {len(lengths)} clips "
+              f"({len(self.segments)} usable), {self.scores.shape[1]}-dim targets "
+              f"from {npz_path}")
+
+    def __len__(self):
+        return len(self.segments) * 20   # small dataset — many windows per clip
+
+    def __getitem__(self, _):
+        s, e, clip_idx = self.segments[self.rng.integers(len(self.segments))]
+        t0 = int(self.rng.integers(0, e - s - self.seq_len + 1)) + s
+        mel = self.mel[t0:t0 + self.seq_len].astype(np.float32)
+        return mel, self.scores[clip_idx]
+
+
+class PairedQualityDataset(Dataset):
+    """PopBuTFy pro/amateur pairs for contrastive ranking from quality_pairs.npz.
+
+    NPZ schema (produced by scripts/prepareQualityData.py) — flat layout:
+      mel_pro:     (total_frames_pro, 40)  float16
+      mel_am:      (total_frames_am,  40)  float16
+      lengths_pro: (n_pairs,)  int32
+      lengths_am:  (n_pairs,)  int32
+
+    Each __getitem__ draws independent random windows from the pro and amateur
+    clips of a randomly selected pair. Windows are drawn independently so the
+    model sees different temporal contexts for each clip within a pair.
+    """
+
+    def __init__(self, npz_path, seq_len=300):
+        self.seq_len = seq_len
+        data = np.load(npz_path, allow_pickle=True)
+        self.mel_pro = data['mel_pro']   # (total_frames_pro, 40) float16
+        self.mel_am  = data['mel_am']    # (total_frames_am,  40) float16
+        lengths_pro  = data['lengths_pro'].astype(np.int32)
+        lengths_am   = data['lengths_am'].astype(np.int32)
+
+        # Build segment index for each side independently
+        self.segs_pro, self.segs_am = [], []
+        off_pro = off_am = 0
+        for i, (lp, la) in enumerate(zip(lengths_pro, lengths_am)):
+            lp, la = int(lp), int(la)
+            if lp >= seq_len and la >= seq_len:
+                self.segs_pro.append((off_pro, off_pro + lp))
+                self.segs_am.append((off_am,  off_am  + la))
+            off_pro += lp
+            off_am  += la
+
+        self.rng = np.random.default_rng()
+        print(f"PairedQualityDataset: {len(self.segs_pro)} usable pairs "
+              f"(of {len(lengths_pro)} total) from {npz_path}")
+
+    def __len__(self):
+        return len(self.segs_pro)
+
+    def __getitem__(self, _):
+        idx = self.rng.integers(len(self.segs_pro))
+        sp, ep = self.segs_pro[idx]
+        sa, ea = self.segs_am[idx]
+        t0p = int(self.rng.integers(0, ep - sp - self.seq_len + 1)) + sp
+        t0a = int(self.rng.integers(0, ea - sa - self.seq_len + 1)) + sa
+        mel_pro = self.mel_pro[t0p:t0p + self.seq_len].astype(np.float32)
+        mel_am  = self.mel_am[t0a:t0a + self.seq_len].astype(np.float32)
+        return mel_pro, mel_am
+
+
+def make_quality_loaders(args, seq_len, batch_size, num_workers):
+    """Build DataLoaders for the active quality variant stages.
+
+    Returns a dict with keys from {'mse', 'ccmusic', 'pairs'} depending on variant.
+    Empty dict if quality_variant == 0.
+    """
+    if args.quality_variant == 0:
+        return {}
+
+    loaders = {}
+
+    # Stage 1: MSE pretraining on SingMOS-Pro AudioScore scalars (Variants 2 and 3)
+    if args.quality_variant in (2, 3):
+        if not args.quality_mse_npz:
+            raise RuntimeError(
+                "--quality-variant 2/3 requires --quality-mse-npz "
+                "(run scripts/prepareQualityData.py --singmos-scores-json ... first)")
+        ds_mse = MseQualityDataset(args.quality_mse_npz, seq_len)
+        loaders['mse'] = DataLoader(ds_mse, batch_size=batch_size, shuffle=True,
+                                    drop_last=True, num_workers=num_workers,
+                                    pin_memory=True,
+                                    persistent_workers=(num_workers > 0))
+
+    # Stage 2: ccmusic 9-dim expert labels (Variant 2 only)
+    if args.quality_variant == 2:
+        if not args.quality_ccmusic_npz:
+            raise RuntimeError(
+                "--quality-variant 2 requires --quality-ccmusic-npz "
+                "(run scripts/prepareQualityData.py --ccmusic-wavs-dir ... first)")
+        ds_cc = CcmusicQualityDataset(args.quality_ccmusic_npz, seq_len)
+        loaders['ccmusic'] = DataLoader(ds_cc, batch_size=min(16, batch_size),
+                                        shuffle=True, drop_last=False,
+                                        num_workers=num_workers, pin_memory=True,
+                                        persistent_workers=(num_workers > 0))
+
+    # Contrastive stage: PopBuTFy pairs (all variants)
+    if not args.quality_pairs_npz:
+        raise RuntimeError(
+            "--quality-variant requires --quality-pairs-npz "
+            "(run scripts/prepareQualityData.py --popbutfy-dir ... first)")
+    ds_pairs = PairedQualityDataset(args.quality_pairs_npz, seq_len)
+    loaders['pairs'] = DataLoader(ds_pairs, batch_size=batch_size, shuffle=True,
+                                  drop_last=True, num_workers=num_workers,
+                                  pin_memory=True,
+                                  persistent_workers=(num_workers > 0))
+
+    return loaders
+
+
 def make_joint_loader(pitch_vad_dir, technique_dirs, seq_len, batch_size,
                       num_workers, balance_datasets=False):
     """Combine PitchVADDataset and one or more TechniqueDatasets via ConcatDataset.
@@ -395,7 +680,7 @@ def make_joint_loader(pitch_vad_dir, technique_dirs, seq_len, batch_size,
     for tech_dir in (technique_dirs or []):
         # Accept both naming conventions: technique_train.npz (VocalSet)
         # and technique_gtsinger_train.npz (GTSinger WAV extraction).
-        for fname in ("technique_train.npz", "technique_gtsinger_train.npz"):
+        for fname in ("technique_train.npz", "technique_gtsinger_train.npz", "note_train.npz"):
             tech_path = os.path.join(tech_dir, fname)
             if os.path.exists(tech_path):
                 tech_datasets.append(TechniqueDataset(tech_dir, seq_len, filename=fname))
@@ -549,6 +834,56 @@ def spec_augment(mel, args):
 # Loss helpers
 # ═══════════════════════════════════════════════════════════════════════
 
+def supcon_loss(embeddings, technique_labels, has_technique, temperature=0.07):
+    """Supervised Contrastive loss on mean-pooled clip embeddings.
+
+    embeddings:       (B, T, hidden)  — raw backbone features before heads
+    technique_labels: (B, T, N)       — clip-level labels broadcast over T
+    has_technique:    (B,)            — 1.0 for samples with technique labels
+    temperature:      scalar
+
+    Only samples with has_technique=1 participate. Clips sharing at least one
+    technique class are treated as positives; clips sharing no class are negatives.
+    Returns scalar loss (0.0 if fewer than 2 labelled samples in batch).
+    """
+    # Select only labelled samples
+    mask = has_technique > 0.5                          # (B,)
+    if mask.sum() < 2:
+        return torch.tensor(0.0, device=embeddings.device)
+
+    # Mean-pool over time → (B', hidden); L2-normalise
+    z = embeddings[mask].mean(dim=1)                    # (B', hidden)
+    z = torch.nn.functional.normalize(z, dim=-1)
+
+    # Clip-level labels: take first time-step (all frames identical for technique)
+    labels = technique_labels[mask, 0, :]               # (B', N)  float
+
+    # Positive mask: pairs sharing at least one technique class
+    # dot product of binary label vectors > 0  ↔  at least one shared class
+    pos_mask = (labels @ labels.T) > 0                  # (B', B')
+    # Remove self-pairs from positives
+    pos_mask.fill_diagonal_(False)
+
+    if pos_mask.sum() == 0:
+        return torch.tensor(0.0, device=embeddings.device)
+
+    # Similarity matrix
+    sim = (z @ z.T) / temperature                       # (B', B')
+    # Subtract max for numerical stability (log-sum-exp trick)
+    sim = sim - sim.max(dim=1, keepdim=True).values.detach()
+
+    # Exclude self from denominator
+    B = z.size(0)
+    self_mask = ~torch.eye(B, dtype=torch.bool, device=z.device)
+    exp_sim = torch.exp(sim) * self_mask                # (B', B')
+
+    log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+
+    # Mean over positive pairs
+    n_pos = pos_mask.sum(dim=1).float().clamp(min=1)
+    loss = -(log_prob * pos_mask).sum(dim=1) / n_pos
+    return loss.mean()
+
 def _build_pitch_target_gpu(f0_dev, sigma_bins, device):
     """Vectorised on-device pitch posteriorgram target. (B, T) f0 → (B, T, 360)."""
     voiced = (f0_dev > 0).float().unsqueeze(-1)                     # (B, T, 1)
@@ -617,6 +952,69 @@ def compute_loss(pred_vad, pred_pitch, pred_technique,
     return total, vad_loss, pitch_loss, technique_loss
 
 
+def compute_quality_loss(model, quality_batch, device, args, epoch):
+    """Compute quality head losses for the current epoch's active stages.
+
+    quality_batch is a dict with a subset of keys:
+      'mse':     (mel, score) from MseQualityDataset — scalar AudioScore targets
+      'ccmusic': (mel, scores_9d) from CcmusicQualityDataset — 9-dim expert targets
+      'pairs':   (mel_pro, mel_am) from PairedQualityDataset — contrastive pairs
+
+    Returns (total_quality_loss, loss_dict) where loss_dict has per-component values.
+    Active stages depend on variant and epoch:
+      Variant 1:  pairs only (all epochs)
+      Variant 2:  mse (epochs ≤ quality_epochs_mse), ccmusic (all epochs),
+                  pairs (all epochs)
+      Variant 3:  mse (epochs ≤ quality_epochs_mse), pairs (all epochs)
+    """
+    losses = {}
+    use_mse     = args.quality_variant in (2, 3) and 'mse'     in quality_batch
+    use_ccmusic = args.quality_variant == 2       and 'ccmusic' in quality_batch
+    use_pairs   = 'pairs' in quality_batch
+
+    mse_stage_active = epoch <= args.quality_epochs_mse
+
+    # ── MSE on AudioScore scalars (SingMOS-Pro clips) ─────────────────────
+    if use_mse and mse_stage_active:
+        mel_mse, score_targets = quality_batch['mse']
+        mel_mse       = mel_mse.to(device)
+        score_targets = score_targets.to(device)           # (B,)
+        _, _, _, q = model(mel_mse)
+        pred_scalar = q[:, 0]                              # (B,) — first dim
+        mse_loss = F.mse_loss(pred_scalar, score_targets)
+        losses['mse'] = mse_loss * args.w_quality_mse
+
+    # ── MSE on ccmusic 9-dim expert labels ────────────────────────────────
+    if use_ccmusic:
+        mel_cc, expert_targets = quality_batch['ccmusic']
+        mel_cc          = mel_cc.to(device)
+        expert_targets  = expert_targets.to(device)        # (B, 9)
+        _, _, _, q = model(mel_cc)                         # q: (B, 9)
+        cc_loss = F.mse_loss(q, expert_targets)
+        losses['ccmusic'] = cc_loss * args.w_quality_mse
+
+    # ── Contrastive ranking on PopBuTFy pairs ─────────────────────────────
+    if use_pairs:
+        mel_pro, mel_am = quality_batch['pairs']
+        mel_pro = mel_pro.to(device)
+        mel_am  = mel_am.to(device)
+        _, _, _, q_pro = model(mel_pro)    # (B, Q)
+        _, _, _, q_am  = model(mel_am)     # (B, Q)
+        # Use dim 0 (overall quality scalar) for ranking regardless of Q
+        score_pro = q_pro[:, 0]            # (B,)
+        score_am  = q_am[:, 0]             # (B,)
+        target = torch.ones_like(score_pro)
+        ranking_loss = F.margin_ranking_loss(
+            score_pro, score_am, target, margin=args.ranking_margin)
+        losses['ranking'] = ranking_loss * args.w_ranking
+
+    if not losses:
+        return torch.tensor(0.0, device=device), {}
+
+    total = sum(losses.values())
+    return total, {k: v.item() for k, v in losses.items()}
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Training loop
 # ═══════════════════════════════════════════════════════════════════════
@@ -637,17 +1035,21 @@ def _get_w_technique(epoch, args):
     return args.w_technique * ramp_progress / args.curriculum_ramp
 
 
-def _set_backbone_frozen(model, frozen: bool, probe_mode: bool = False):
+def _set_backbone_frozen(model, frozen: bool, probe_mode: bool = False,
+                         quality_probe: bool = False):
     """Freeze or unfreeze backbone weights.
 
-    probe_mode=True: freeze backbone + pitch/VAD heads; only head_technique trains.
-      This is the MERT linear-probing setup — pitch/VAD heads never see technique
-      data so there is zero distribution drift on the pitch evaluation set.
+    quality_probe=True: freeze everything except head_quality — used when
+      training the scoring head on top of a fully trained pitch+technique checkpoint.
 
-    probe_mode=False (default): freeze backbone only; pitch/VAD heads stay trainable.
-      Used for staged training where pitch/VAD heads continue refining.
+    probe_mode=True (no quality_probe): freeze backbone + pitch/VAD heads;
+      only head_technique trains. The MERT linear-probing setup.
+
+    probe_mode=False: freeze backbone only; pitch/VAD/technique heads stay trainable.
     """
-    if probe_mode:
+    if quality_probe:
+        trainable_tops = {"head_quality"}
+    elif probe_mode:
         trainable_tops = {"head_technique"}
     elif frozen:
         trainable_tops = {"head_vad", "head_pitch", "head_technique"}
@@ -661,79 +1063,160 @@ def _set_backbone_frozen(model, frozen: bool, probe_mode: bool = False):
         else:
             param.requires_grad = (top in trainable_tops)
 
-    state = "FROZEN" if (frozen or probe_mode) else "unfrozen"
+    state = "FROZEN" if (frozen or probe_mode or quality_probe) else "unfrozen"
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Backbone {state} — {trainable:,} trainable parameters")
 
 
 def train_one_epoch(model, loader, optimizer, scheduler, writer,
                     epoch, device, args, noise_pool=None,
-                    global_step_offset=0):
+                    global_step_offset=0, quality_loaders=None):
+    """Train for one epoch.
+
+    quality_loaders: dict returned by make_quality_loaders, or None/empty.
+      When non-empty, each quality loader is iterated in lock-step with the main
+      loader (cycling the shorter ones). The pitch/VAD/technique loss is zero when
+      quality_variant > 0 and probe_mode is set — only head_quality trains.
+    """
     model.train()
-    running = {'total': 0.0, 'vad': 0.0, 'pitch': 0.0, 'technique': 0.0}
+    running = {'total': 0.0, 'vad': 0.0, 'pitch': 0.0, 'technique': 0.0,
+               'contrastive': 0.0,
+               'quality_mse': 0.0, 'quality_ccmusic': 0.0, 'quality_ranking': 0.0}
     n_batches = 0
 
-    do_noise    = args.augment in ("noise", "noise_specaug") and noise_pool is not None
-    do_specaug  = args.augment == "noise_specaug"
+    quality_loaders = quality_loaders or {}
+    quality_iters   = {k: iter(v) for k, v in quality_loaders.items()}
 
-    pbar = tqdm(loader, desc=f"Epoch {epoch}", unit="batch")
-    for batch_idx, (mel, f0, vad, technique, has_technique) in enumerate(pbar):
-        mel           = mel.to(device)
-        f0            = f0.to(device)
-        vad           = vad.to(device)
-        technique     = technique.to(device)
-        has_technique = has_technique.to(device)
+    do_noise   = args.augment in ("noise", "noise_specaug") and noise_pool is not None
+    do_specaug = args.augment == "noise_specaug"
+    is_quality_only = args.quality_variant > 0  # backbone frozen, only head_quality trains
 
-        if do_noise:
-            B = mel.size(0)
-            noise_np = noise_pool.draw_batch(B)
-            noise_t  = torch.from_numpy(noise_np).to(device)
-            mel = augment_mel_batch(mel, noise_t, args, device)
-        if do_specaug:
-            mel = spec_augment(mel, args)
+    # When training quality head, the main pitch/technique loader is skipped —
+    # we iterate quality loaders directly. Use the 'pairs' loader to set epoch length.
+    if is_quality_only:
+        primary_iter = iter(quality_loaders.get('pairs', []))
+        pbar = tqdm(quality_loaders.get('pairs', []),
+                    desc=f"Epoch {epoch} [quality]", unit="batch")
+    else:
+        primary_iter = None
+        pbar = tqdm(loader, desc=f"Epoch {epoch}", unit="batch")
 
-        pred_vad, pred_pitch, pred_technique, _ = model(mel)
+    def _next_quality(key):
+        """Draw next batch from a quality loader, cycling if exhausted."""
+        try:
+            return next(quality_iters[key])
+        except StopIteration:
+            quality_iters[key] = iter(quality_loaders[key])
+            return next(quality_iters[key])
 
-        effective_w_technique = _get_w_technique(epoch, args)
-        total, vad_l, pitch_l, tech_l = compute_loss(
-            pred_vad, pred_pitch, pred_technique,
-            vad, f0, technique, has_technique,
-            args, device,
-            w_technique_override=effective_w_technique,
-        )
+    if is_quality_only:
+        # Quality-head-only training loop
+        for batch_idx, (mel_pro, mel_am) in enumerate(pbar):
+            quality_batch = {'pairs': (mel_pro, mel_am)}
+            if 'mse' in quality_loaders:
+                quality_batch['mse'] = _next_quality('mse')
+            if 'ccmusic' in quality_loaders:
+                quality_batch['ccmusic'] = _next_quality('ccmusic')
 
-        optimizer.zero_grad()
-        total.backward()
-        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
+            total, q_losses = compute_quality_loss(model, quality_batch, device, args, epoch)
 
-        if args._sched_step == "iter":
-            scheduler.step()
+            optimizer.zero_grad()
+            total.backward()
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            if args._sched_step == "iter":
+                scheduler.step()
 
-        step = global_step_offset + batch_idx
-        writer.add_scalar("train/grad_norm", grad_norm, step)
+            step = global_step_offset + batch_idx
+            writer.add_scalar("train/grad_norm", grad_norm, step)
 
-        running['total']     += total.item()
-        running['vad']       += vad_l.item()
-        running['pitch']     += pitch_l.item()
-        running['technique'] += tech_l.item()
-        n_batches += 1
+            running['total'] += total.item()
+            for k, v in q_losses.items():
+                running[f'quality_{k}'] += v
+            n_batches += 1
 
-        pbar.set_postfix(
-            loss=f"{running['total']/n_batches:.4f}",
-            vad=f"{running['vad']/n_batches:.4f}",
-            pitch=f"{running['pitch']/n_batches:.4f}",
-            tech=f"{running['technique']/n_batches:.4f}",
-        )
+            pbar.set_postfix(
+                loss=f"{running['total']/n_batches:.4f}",
+                rank=f"{running['quality_ranking']/n_batches:.4f}",
+                mse=f"{running['quality_mse']/n_batches:.4f}",
+            )
+    else:
+        # Standard pitch/VAD/technique training loop
+        use_contrastive = getattr(args, 'contrastive_technique', False) and bool(getattr(args, 'technique_dirs', None))
+        for batch_idx, (mel, f0, vad, technique, has_technique) in enumerate(pbar):
+            mel           = mel.to(device)
+            f0            = f0.to(device)
+            vad           = vad.to(device)
+            technique     = technique.to(device)
+            has_technique = has_technique.to(device)
+
+            if do_noise:
+                B = mel.size(0)
+                noise_np = noise_pool.draw_batch(B)
+                noise_t  = torch.from_numpy(noise_np).to(device)
+                mel = augment_mel_batch(mel, noise_t, args, device)
+            if do_specaug:
+                mel = spec_augment(mel, args)
+
+            if use_contrastive:
+                pred_vad, pred_pitch, pred_technique, _, embeddings = model(
+                    mel, return_embeddings=True)
+            else:
+                pred_vad, pred_pitch, pred_technique, _ = model(mel)
+
+            effective_w_technique = _get_w_technique(epoch, args)
+            total, vad_l, pitch_l, tech_l = compute_loss(
+                pred_vad, pred_pitch, pred_technique,
+                vad, f0, technique, has_technique,
+                args, device,
+                w_technique_override=effective_w_technique,
+            )
+
+            if use_contrastive:
+                con_l = supcon_loss(
+                    embeddings, technique, has_technique,
+                    temperature=args.contrastive_temp,
+                )
+                total = total + args.w_contrastive_technique * con_l
+            else:
+                con_l = torch.tensor(0.0)
+
+            optimizer.zero_grad()
+            total.backward()
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            if args._sched_step == "iter":
+                scheduler.step()
+
+            step = global_step_offset + batch_idx
+            writer.add_scalar("train/grad_norm", grad_norm, step)
+
+            running['total']       += total.item()
+            running['vad']         += vad_l.item()
+            running['pitch']       += pitch_l.item()
+            running['technique']   += tech_l.item()
+            running['contrastive'] += con_l.item()
+            n_batches += 1
+
+            pbar.set_postfix(
+                loss=f"{running['total']/n_batches:.4f}",
+                vad=f"{running['vad']/n_batches:.4f}",
+                pitch=f"{running['pitch']/n_batches:.4f}",
+                tech=f"{running['technique']/n_batches:.4f}",
+                **({"con": f"{running['contrastive']/n_batches:.4f}"} if use_contrastive else {}),
+            )
 
     if n_batches == 0:
         warnings.warn("No batches processed this epoch.", RuntimeWarning)
-        return float("nan"), {'vad': float('nan'), 'pitch': float('nan'), 'technique': float('nan')}
+        return float("nan"), {k: float('nan') for k in running}
 
     avgs = {k: v / n_batches for k, v in running.items()}
     for k, v in avgs.items():
-        writer.add_scalar(f"train/{k}", v, epoch)
-    writer.add_scalar("train/lr", optimizer.param_groups[0]['lr'], epoch)
+        if v > 0 or k == 'total':
+            writer.add_scalar(f"train/{k}", v, epoch)
+    writer.add_scalar("train/lr", optimizer.param_groups[-1]['lr'], epoch)
+    if len(optimizer.param_groups) > 1:
+        writer.add_scalar("train/lr_backbone", optimizer.param_groups[0]['lr'], epoch)
     return avgs['total'], avgs
 
 
@@ -807,6 +1290,8 @@ def evaluate(model, data_dir, technique_dirs, writer, epoch, device, args):
             stag = tag.replace(' ', '').replace('+', 'p').replace('-', 'n')
             writer.add_scalar(f"eval/vdr_{stag}", vd, epoch)
             writer.add_scalar(f"eval/rpa_{stag}", rp, epoch)
+            if not np.isfinite(snr) and not np.isnan(vd):
+                results['vdr_clean'] = vd
 
         macro_rpa = float(np.mean(rpa_values)) if rpa_values else float('nan')
         results['macro_rpa'] = macro_rpa
@@ -818,7 +1303,7 @@ def evaluate(model, data_dir, technique_dirs, writer, epoch, device, args):
     # multi-dataset runs (VocalSet + GTSinger) evaluate all classes together.
     tech_files = []
     for tdir in (technique_dirs or []):
-        for _fname in ("technique_test.npz", "technique_gtsinger_test.npz"):
+        for _fname in ("technique_test.npz", "technique_gtsinger_test.npz", "note_test.npz"):
             _p = os.path.join(tdir, _fname)
             if os.path.exists(_p):
                 tech_files.append(_p)
@@ -910,11 +1395,21 @@ def main():
     ckpt_dir     = os.path.join(output_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Build model
+    # Validate quality variant dependencies
+    if args.quality_variant > 0 and not args.probe_mode:
+        raise RuntimeError("--quality-variant requires --probe-mode")
+    if args.quality_variant > 0 and not args.resume:
+        raise RuntimeError("--quality-variant requires --resume (trained pitch+technique checkpoint)")
+
+    # Build model — quality_head dim: 0=off, 1=scalar, 9=multi-dim
+    quality_head_dim = {0: 0, 1: 1, 2: 9, 3: 1}[args.quality_variant]
     model_kwargs = dict(causal=args.causal)
     if args.hidden   is not None: model_kwargs['hidden']   = args.hidden
     if args.n_blocks is not None: model_kwargs['n_blocks'] = args.n_blocks
+    if args.n_layers is not None: model_kwargs['n_layers'] = args.n_layers
+    if args.n_heads  is not None: model_kwargs['n_heads']  = args.n_heads
     if args.deep_technique_head:  model_kwargs['deep_technique_head'] = True
+    if quality_head_dim:          model_kwargs['quality_head'] = quality_head_dim
     model = build_model(args.arch, **model_kwargs)
 
     start_epoch = 1
@@ -950,13 +1445,34 @@ def main():
              f"  p_clean={args.p_clean}" if args.augment != "none" else ""))
 
     # Data
-    loader = make_joint_loader(data_dir, tech_dirs, args.seq_len,
-                               args.batch_size, args.num_workers,
-                               balance_datasets=args.balance_datasets)
+    quality_loaders = {}
+    if args.quality_variant > 0:
+        quality_loaders = make_quality_loaders(args, args.seq_len, args.batch_size, args.num_workers)
+        # Quality training doesn't need the main pitch/VAD/technique loader
+        loader = None
+    else:
+        loader = make_joint_loader(data_dir, tech_dirs, args.seq_len,
+                                   args.batch_size, args.num_workers,
+                                   balance_datasets=args.balance_datasets)
 
     # Optimizer + scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                  betas=(0.9, 0.98), weight_decay=1e-4)
+    # Split into two param groups when --lr-backbone is set so the backbone
+    # shifts slowly while heads learn at the full --lr rate.
+    _HEAD_PREFIXES = ("head_vad", "head_pitch", "head_technique", "head_quality")
+    if args.lr_backbone is not None and not args.probe_mode:
+        backbone_params = [p for n, p in model.named_parameters()
+                           if not any(n.startswith(h) for h in _HEAD_PREFIXES)]
+        head_params     = [p for n, p in model.named_parameters()
+                           if any(n.startswith(h) for h in _HEAD_PREFIXES)]
+        optimizer = torch.optim.AdamW(
+            [{"params": backbone_params, "lr": args.lr_backbone},
+             {"params": head_params,     "lr": args.lr}],
+            betas=(0.9, 0.98), weight_decay=1e-4)
+        print(f"  Differential LR: backbone={args.lr_backbone:.2e}  heads={args.lr:.2e}  "
+              f"({len(backbone_params)} backbone params, {len(head_params)} head params)")
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                      betas=(0.9, 0.98), weight_decay=1e-4)
 
     from torch.optim.lr_scheduler import (LinearLR, CosineAnnealingLR,
                                            SequentialLR, LambdaLR)
@@ -964,8 +1480,9 @@ def main():
         scheduler = LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
         args._sched_step = "epoch"
     else:  # cosine_warmup
-        total_iters  = len(loader) * args.epochs
-        warmup_iters = len(loader)
+        ref_loader   = quality_loaders.get('pairs', loader)
+        total_iters  = len(ref_loader) * args.epochs
+        warmup_iters = len(ref_loader)
         warmup  = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_iters)
         cosine  = CosineAnnealingLR(optimizer,
                                     T_max=total_iters - warmup_iters,
@@ -975,11 +1492,13 @@ def main():
         args._sched_step = "iter"
 
     if resume_ckpt:
-        if "optimizer" in resume_ckpt and not args.probe_mode:
+        _param_groups_changed = args.probe_mode or (args.lr_backbone is not None)
+        if "optimizer" in resume_ckpt and not _param_groups_changed:
             optimizer.load_state_dict(resume_ckpt["optimizer"])
-        elif "optimizer" in resume_ckpt and args.probe_mode:
-            print("  Probe mode: skipping optimizer state (param groups changed)")
-        if "scheduler" in resume_ckpt and not args.probe_mode:
+        elif "optimizer" in resume_ckpt and _param_groups_changed:
+            reason = "probe mode" if args.probe_mode else "differential LR (param groups changed)"
+            print(f"  Skipping optimizer state: {reason}")
+        if "scheduler" in resume_ckpt and not _param_groups_changed:
             scheduler.load_state_dict(resume_ckpt["scheduler"])
         del resume_ckpt
 
@@ -990,9 +1509,16 @@ def main():
     patience_count = 0
     global_step    = 0
 
-    if args.probe_mode:
+    if args.quality_variant > 0:
+        # Quality head probe: everything frozen except head_quality
+        _set_backbone_frozen(model, frozen=True, quality_probe=True)
+        print(f"  Quality probe (variant {args.quality_variant}): "
+              f"only head_quality trains for all {args.epochs} epochs")
+    elif args.probe_mode:
         _set_backbone_frozen(model, frozen=True, probe_mode=True)
         print(f"  Probe mode: backbone + pitch/VAD heads frozen for all {args.epochs} epochs")
+
+    if args.probe_mode or args.quality_variant > 0:
         # Rebuild optimizer over trainable params only so frozen params get no momentum state
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, model.parameters()),
@@ -1000,13 +1526,16 @@ def main():
         )
 
     freeze_until = start_epoch + args.freeze_backbone_epochs
-    if not args.probe_mode and args.freeze_backbone_epochs > 0:
+    if not args.probe_mode and args.quality_variant == 0 and args.freeze_backbone_epochs > 0:
         _set_backbone_frozen(model, frozen=True)
         print(f"  Backbone frozen for epochs {start_epoch}–{freeze_until - 1}, "
               f"unfreezes at epoch {freeze_until}")
 
+    ref_loader_len = len(quality_loaders.get('pairs', loader)) if quality_loaders else len(loader)
+
     for epoch in range(start_epoch, start_epoch + args.epochs):
-        if not args.probe_mode and args.freeze_backbone_epochs > 0 and epoch == freeze_until:
+        if (args.quality_variant == 0 and not args.probe_mode
+                and args.freeze_backbone_epochs > 0 and epoch == freeze_until):
             _set_backbone_frozen(model, frozen=False)
             print(f"  Epoch {epoch}: backbone unfrozen — joint fine-tuning begins")
 
@@ -1015,17 +1544,24 @@ def main():
             model, loader, optimizer, scheduler, writer,
             epoch, device, args, noise_pool=noise_pool,
             global_step_offset=global_step,
+            quality_loaders=quality_loaders if args.quality_variant > 0 else None,
         )
-        global_step += len(loader)
+        global_step += ref_loader_len
 
         if args._sched_step == "epoch":
             scheduler.step()
 
         dt = time.time() - t0
-        print(f"  Epoch {epoch} — {dt:.1f}s — loss={train_loss:.5f}"
-              f"  (vad={train_losses['vad']:.4f}"
-              f"  pitch={train_losses['pitch']:.4f}"
-              f"  tech={train_losses['technique']:.4f})")
+        if args.quality_variant > 0:
+            print(f"  Epoch {epoch} — {dt:.1f}s — loss={train_loss:.5f}"
+                  f"  (ranking={train_losses.get('quality_ranking', 0):.4f}"
+                  f"  mse={train_losses.get('quality_mse', 0):.4f}"
+                  f"  ccmusic={train_losses.get('quality_ccmusic', 0):.4f})")
+        else:
+            print(f"  Epoch {epoch} — {dt:.1f}s — loss={train_loss:.5f}"
+                  f"  (vad={train_losses['vad']:.4f}"
+                  f"  pitch={train_losses['pitch']:.4f}"
+                  f"  tech={train_losses['technique']:.4f})")
 
         # Checkpoint every epoch
         ckpt = {
@@ -1045,34 +1581,47 @@ def main():
             best_loss = train_loss
             torch.save(ckpt, os.path.join(ckpt_dir, "best_loss.pth"))
 
-        # Evaluation
+        # Evaluation — every eval_every epochs for both quality and standard paths
         if epoch % args.eval_every == 0 or epoch == start_epoch:
-            eval_res = evaluate(model, data_dir, tech_dirs,
-                                writer, epoch, device, args)
-            if eval_res:
-                # Prefer macro F1 as primary metric (technique is the goal);
-                # fall back to macro RPA when no technique eval data.
+            if args.quality_variant > 0:
+                # Quality has no held-out eval set; use neg ranking loss as the tracked metric
+                metric = -train_losses.get('quality_ranking', train_loss)
+                metric_name = "neg_ranking_loss"
+                eval_res = {'neg_ranking_loss': metric}
+            else:
+                eval_res = evaluate(model, data_dir, tech_dirs,
+                                    writer, epoch, device, args)
                 if 'macro_f1' in eval_res:
-                    metric = eval_res['macro_f1']
-                    metric_name = "macro_f1"
+                    vdr_clean = eval_res.get('vdr_clean', 1.0)
+                    w = args.metric_vdr_weight
+                    metric = eval_res['macro_f1'] + w * vdr_clean
+                    metric_name = f"f1+{w}*vdr"
                 elif 'macro_rpa' in eval_res:
-                    metric = eval_res['macro_rpa']
-                    metric_name = "macro_rpa"
+                    # Use RPA + w*VDR_clean so the checkpoint reflects both pitch
+                    # accuracy and voice detection — RPA alone barely varies and
+                    # picks early epochs where VDR is still low.
+                    vdr_clean = eval_res.get('vdr_clean', 1.0)
+                    w = args.metric_vdr_weight
+                    metric = eval_res['macro_rpa'] + w * vdr_clean
+                    metric_name = f"rpa+{w}*vdr"
                 else:
                     metric = float('nan')
                     metric_name = "none"
+        else:
+            eval_res = {}
 
-                if not np.isnan(metric) and metric > best_metric:
-                    best_metric = metric
-                    patience_count = 0
-                    torch.save(ckpt, os.path.join(ckpt_dir, "best_metric.pth"))
-                    print(f"  New best {metric_name}: {best_metric:.4f} — checkpoint saved.")
-                elif not np.isnan(metric):
-                    patience_count += args.eval_every
-                    if args.patience > 0 and patience_count >= args.patience:
-                        print(f"  Early stopping after {epoch} epochs "
-                              f"(best {metric_name}: {best_metric:.4f})")
-                        break
+        if eval_res and not np.isnan(metric):
+            if metric > best_metric:
+                best_metric = metric
+                patience_count = 0
+                torch.save(ckpt, os.path.join(ckpt_dir, "best_metric.pth"))
+                print(f"  New best {metric_name}: {best_metric:.4f} — checkpoint saved.")
+            else:
+                patience_count += args.eval_every
+                if args.patience > 0 and patience_count >= args.patience:
+                    print(f"  Early stopping after {epoch} epochs "
+                          f"(best {metric_name}: {best_metric:.4f})")
+                    break
 
     writer.close()
     print(f"\nTraining complete.")
