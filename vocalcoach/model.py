@@ -342,7 +342,7 @@ class VocalCoachTCN(nn.Module):
 
     def __init__(self, n_mels=N_MELS, hidden=128, n_blocks=8, kernel_size=3,
                  causal=True, dropout=0.1, n_techniques=N_TECHNIQUES,
-                 quality_head=0, deep_technique_head=False):
+                 quality_head=0, deep_technique_head=False, note_head=False):
         super().__init__()
         self.causal  = causal
         self.hidden  = hidden
@@ -390,10 +390,20 @@ class VocalCoachTCN(nn.Module):
                 nn.Linear(hidden // 4, quality_head),
             )
 
+        # ── Optional note segmentation head (Variant 4) ──
+        # Two independent binary classifiers sharing the same backbone.
+        # note_onset:  1 at frames where a new note begins
+        # note_offset: 1 at frames where a note ends
+        self.has_note_head = note_head
+        if note_head:
+            self.head_note_onset  = nn.Linear(hidden, 1)
+            self.head_note_offset = nn.Linear(hidden, 1)
+
         self._init_weights()
         n = sum(p.numel() for p in self.parameters())
         print(f"VocalCoachTCN: {n:,} parameters "
               f"(hidden={hidden}, blocks={n_blocks}, causal={causal}"
+              f"{', note_head=True' if note_head else ''}"
               f"{f', quality_head={quality_head}' if quality_head else ''})")
 
     def _init_weights(self):
@@ -429,10 +439,12 @@ class VocalCoachTCN(nn.Module):
         pitch     = torch.sigmoid(self.head_pitch(x))      # (B, T, 360)
         technique = torch.sigmoid(self.head_technique(x))  # (B, T, N)
         quality   = self.head_quality(x.mean(dim=1)) if self.quality_dims else None
+        note_onset  = torch.sigmoid(self.head_note_onset(x))  if self.has_note_head else None
+        note_offset = torch.sigmoid(self.head_note_offset(x)) if self.has_note_head else None
 
         if return_embeddings:
-            return vad, pitch, technique, quality, x
-        return vad, pitch, technique, quality
+            return vad, pitch, technique, quality, note_onset, note_offset, x
+        return vad, pitch, technique, quality, note_onset, note_offset
 
     def receptive_field_ms(self, hop_ms=10):
         """Temporal receptive field of the TCN stack in milliseconds."""
@@ -608,7 +620,7 @@ class VocalCoachConformer(nn.Module):
     def __init__(self, n_mels=N_MELS, hidden=64, n_layers=4, n_heads=4,
                  ff_expansion=4, conv_kernel=31, dropout=0.1,
                  causal=False, n_techniques=N_TECHNIQUES, quality_head=0,
-                 deep_technique_head=False):
+                 deep_technique_head=False, note_head=False):
         super().__init__()
         assert hidden % n_heads == 0, (
             f"hidden ({hidden}) must be divisible by n_heads ({n_heads})")
@@ -649,10 +661,17 @@ class VocalCoachConformer(nn.Module):
                 nn.Linear(hidden // 4, quality_head),
             )
 
+        # ── Optional note segmentation head (Variant 4) ──
+        self.has_note_head = note_head
+        if note_head:
+            self.head_note_onset  = nn.Linear(hidden, 1)
+            self.head_note_offset = nn.Linear(hidden, 1)
+
         n = sum(p.numel() for p in self.parameters())
         print(f"VocalCoachConformer: {n:,} parameters "
               f"(hidden={hidden}, layers={n_layers}, heads={n_heads}, "
-              f"causal={causal}{f', quality_head={quality_head}' if quality_head else ''})")
+              f"causal={causal}{', note_head=True' if note_head else ''}"
+              f"{f', quality_head={quality_head}' if quality_head else ''})")
 
     def forward(self, mel, return_embeddings=False):
         """Run the model on a batch of mel spectrograms.
@@ -678,10 +697,12 @@ class VocalCoachConformer(nn.Module):
         pitch     = torch.sigmoid(self.head_pitch(x))
         technique = torch.sigmoid(self.head_technique(x))
         quality   = self.head_quality(x.mean(dim=1)) if self.quality_dims else None
+        note_onset  = torch.sigmoid(self.head_note_onset(x))  if self.has_note_head else None
+        note_offset = torch.sigmoid(self.head_note_offset(x)) if self.has_note_head else None
 
         if return_embeddings:
-            return vad, pitch, technique, quality, x
-        return vad, pitch, technique, quality
+            return vad, pitch, technique, quality, note_onset, note_offset, x
+        return vad, pitch, technique, quality, note_onset, note_offset
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -724,7 +745,7 @@ if __name__ == '__main__':
     print("=" * 60)
     tcn = VocalCoachTCN(hidden=128, n_blocks=8, causal=True)
     x = torch.randn(B, T, N_MELS)
-    vad, pitch, technique, _ = tcn(x)
+    vad, pitch, technique, _, _, _ = tcn(x)
     print(f"  Input:       {tuple(x.shape)}")
     print(f"  VAD:         {tuple(vad.shape)}  "
           f"range [{vad.min():.3f}, {vad.max():.3f}]")
@@ -736,7 +757,7 @@ if __name__ == '__main__':
     print()
     print("Experiment A (non-causal variant, offline)")
     tcn_nc = VocalCoachTCN(hidden=128, n_blocks=8, causal=False)
-    vad, pitch, technique, _ = tcn_nc(x)
+    vad, pitch, technique, _, _, _ = tcn_nc(x)
     print(f"  Technique: {tuple(technique.shape)}  ✓")
 
     print()
@@ -745,7 +766,7 @@ if __name__ == '__main__':
     print("=" * 60)
     conformer = VocalCoachConformer(hidden=64, n_layers=4, n_heads=4,
                                     causal=False)
-    vad, pitch, technique, _ = conformer(x)
+    vad, pitch, technique, _, _, _ = conformer(x)
     print(f"  Input:       {tuple(x.shape)}")
     print(f"  VAD:         {tuple(vad.shape)}  "
           f"range [{vad.min():.3f}, {vad.max():.3f}]")
@@ -758,7 +779,7 @@ if __name__ == '__main__':
     print("=" * 60)
     conformer_c = VocalCoachConformer(hidden=64, n_layers=4, n_heads=4,
                                       causal=True)
-    vad, pitch, technique, _ = conformer_c(x)
+    vad, pitch, technique, _, _, _ = conformer_c(x)
     print(f"  Input:       {tuple(x.shape)}")
     print(f"  VAD:         {tuple(vad.shape)}  "
           f"range [{vad.min():.3f}, {vad.max():.3f}]")
@@ -773,7 +794,7 @@ if __name__ == '__main__':
                      ('conformer', dict(hidden=32, n_layers=2, n_heads=4))]:
         m = build_model(arch, **kw)
         x_small = torch.randn(1, 200, N_MELS)
-        v, p, t, _ = m(x_small)
+        v, p, t, _, _, _ = m(x_small)
         print(f"  {arch:12s} → vad {tuple(v.shape)}, "
               f"pitch {tuple(p.shape)}, technique {tuple(t.shape)}  ✓")
 

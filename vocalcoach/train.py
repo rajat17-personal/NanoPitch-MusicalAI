@@ -172,6 +172,44 @@ parser.add_argument("--balance-datasets", action="store_true",
                          "imbalance (e.g. GTSinger 10k vs VocalSet 824 clips) that "
                          "causes minority-source classes to get F1=0.")
 
+# ── Note segmentation head (Variant 4) ───────────────────────────────────────
+parser.add_argument("--note-head", action="store_true", default=False,
+                    help="enable note segmentation head (Variant 4): adds head_note_onset "
+                         "and head_note_offset — two binary frame-level classifiers. "
+                         "Requires --note-dirs pointing to dirs with note_train.npz. "
+                         "Default off — no change to existing runs.")
+parser.add_argument("--note-dirs", type=str, nargs="*", default=None,
+                    help="directories containing note_train.npz for note onset/offset "
+                         "supervision. If None while --note-head is set, note head "
+                         "trains on zero pseudo-labels.")
+parser.add_argument("--w-note", type=float, default=1.0,
+                    help="weight for note onset+offset loss (BCE). Only active with "
+                         "--note-head. Default 1.0.")
+
+# ── Warm-up all heads before technique/quality ────────────────────────────────
+parser.add_argument("--warmup-heads-epochs", type=int, default=0,
+                    help="train pitch+VAD (+ note if --note-head) for this many epochs "
+                         "before enabling technique and quality losses. "
+                         "0 = disabled (default, existing behaviour). "
+                         "Use e.g. 30-50 to let pitch/VAD/note converge before "
+                         "technique gradients compete. Supersedes --curriculum-warmup "
+                         "when both are set.")
+
+# ── Dataset curriculum: pretrain on one source, fine-tune on another ──────────
+parser.add_argument("--pretrain-data-dir", type=str, default=None,
+                    help="if set, train on this data source alone for "
+                         "--pretrain-epochs epochs before switching to the main "
+                         "--data-dir. Implements dataset curriculum: e.g. GTSinger-only "
+                         "warm-up then fine-tune on VocalSet+GTSinger. "
+                         "Default None = single dataset throughout (existing behaviour).")
+parser.add_argument("--pretrain-epochs", type=int, default=30,
+                    help="number of epochs to train exclusively on --pretrain-data-dir "
+                         "before switching to --data-dir. Only active when "
+                         "--pretrain-data-dir is set. Default 30.")
+parser.add_argument("--pretrain-technique-dirs", type=str, nargs="*", default=None,
+                    help="technique directories to use during --pretrain-epochs. "
+                         "If None, uses --technique-dirs for all epochs.")
+
 # Device
 parser.add_argument("--device", type=str, default="cuda",
                     help="cpu / cuda / mps / auto")
@@ -460,6 +498,53 @@ class TechniqueDataset(Dataset):
 
         has_technique = np.float32(1.0)
         return mel, f0, vad, technique, has_technique
+
+
+class NoteDataset(Dataset):
+    """Loads note_train.npz for note onset/offset frame-level supervision (Variant 4).
+
+    NPZ schema (flat layout, produced by extractNotes.py or similar):
+      mel:     (total_frames, 40)   float16
+      onset:   (total_frames,)      float32  — 1.0 at note onset frames
+      offset:  (total_frames,)      float32  — 1.0 at note offset frames
+      lengths: (n_clips,)           int32
+
+    Returns (onset_target, offset_target, has_note) per sample where
+    has_note=1.0 signals that this sample has real labels.
+    """
+
+    def __init__(self, note_dir, seq_len=300, filename="note_train.npz"):
+        self.seq_len = seq_len
+        path = os.path.join(note_dir, filename)
+        data = np.load(path, allow_pickle=False)
+
+        self.mel    = data["mel"]                          # (total_frames, 40) float16
+        self.onset  = data["onset"].astype(np.float32)    # (total_frames,)
+        self.offset = data["offset"].astype(np.float32)   # (total_frames,)
+        lengths     = data["lengths"]
+
+        self.segments = []
+        offset_idx = 0
+        for length in lengths:
+            length = int(length)
+            if length >= seq_len:
+                self.segments.append((offset_idx, offset_idx + length))
+            offset_idx += length
+
+        self.rng = np.random.default_rng()
+        print(f"NoteDataset ({filename}): {len(lengths)} clips, "
+              f"{len(self.mel):,} frames, {len(self.segments)} usable segments")
+
+    def __len__(self):
+        return min(len(self.segments) * 5, 15000)
+
+    def __getitem__(self, _):
+        seg_idx = self.rng.integers(len(self.segments))
+        s, e = self.segments[seg_idx]
+        t0 = self.rng.integers(0, e - s - self.seq_len + 1) + s
+        onset  = self.onset [t0:t0 + self.seq_len]        # (T,)
+        offset = self.offset[t0:t0 + self.seq_len]        # (T,)
+        return onset, offset, np.float32(1.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -897,17 +982,25 @@ def _build_pitch_target_gpu(f0_dev, sigma_bins, device):
 
 def compute_loss(pred_vad, pred_pitch, pred_technique,
                  vad_target, f0_target, technique_target, has_technique,
-                 args, device, w_technique_override=None):
+                 args, device, w_technique_override=None,
+                 note_onset=None, note_offset=None,
+                 note_onset_target=None, note_offset_target=None,
+                 has_note=None):
     """Compute multi-task loss.
 
     Args:
-        pred_vad:         (B, T, 1)
-        pred_pitch:       (B, T, 360)
-        pred_technique:   (B, T, N)
-        vad_target:       (B, T)
-        f0_target:        (B, T)
-        technique_target: (B, T, N)
-        has_technique:    (B,)  — 1.0 if sample has technique labels, else 0.0
+        pred_vad:           (B, T, 1)
+        pred_pitch:         (B, T, 360)
+        pred_technique:     (B, T, N)
+        vad_target:         (B, T)
+        f0_target:          (B, T)
+        technique_target:   (B, T, N)
+        has_technique:      (B,)  — 1.0 if sample has technique labels, else 0.0
+        note_onset:         (B, T, 1) or None — predicted note onset probability
+        note_offset:        (B, T, 1) or None — predicted note offset probability
+        note_onset_target:  (B, T) or None — binary onset frame labels
+        note_offset_target: (B, T) or None — binary offset frame labels
+        has_note:           (B,) or None — 1.0 if sample has note labels
     """
     # ── VAD loss (pos-weighted BCE) ──────────────────────────────────────
     bce_none = nn.BCELoss(reduction='none')
@@ -949,7 +1042,22 @@ def compute_loss(pred_vad, pred_pitch, pred_technique,
     total = (args.w_vad * vad_loss
              + args.w_pitch * pitch_loss
              + w_tech * technique_loss)
-    return total, vad_loss, pitch_loss, technique_loss
+
+    # ── Note segmentation loss (Variant 4) — only when --note-head is active ──
+    note_loss = torch.tensor(0.0, device=device)
+    if (note_onset is not None and note_offset is not None
+            and note_onset_target is not None and note_offset_target is not None
+            and has_note is not None):
+        note_mask = has_note.view(-1, 1, 1)                         # (B, 1, 1)
+        if note_mask.sum() > 0:
+            onset_loss  = bce_none(note_onset.squeeze(-1),  note_onset_target)   # (B, T)
+            offset_loss = bce_none(note_offset.squeeze(-1), note_offset_target)  # (B, T)
+            note_loss = ((note_mask.squeeze(-1) * onset_loss).sum()
+                         + (note_mask.squeeze(-1) * offset_loss).sum()) / \
+                        (note_mask.sum() * note_onset_target.shape[1] * 2)
+        total = total + args.w_note * note_loss
+
+    return total, vad_loss, pitch_loss, technique_loss, note_loss
 
 
 def compute_quality_loss(model, quality_batch, device, args, epoch):
@@ -979,7 +1087,7 @@ def compute_quality_loss(model, quality_batch, device, args, epoch):
         mel_mse, score_targets = quality_batch['mse']
         mel_mse       = mel_mse.to(device)
         score_targets = score_targets.to(device)           # (B,)
-        _, _, _, q = model(mel_mse)
+        _, _, _, q, _, _ = model(mel_mse)
         pred_scalar = q[:, 0]                              # (B,) — first dim
         mse_loss = F.mse_loss(pred_scalar, score_targets)
         losses['mse'] = mse_loss * args.w_quality_mse
@@ -989,7 +1097,7 @@ def compute_quality_loss(model, quality_batch, device, args, epoch):
         mel_cc, expert_targets = quality_batch['ccmusic']
         mel_cc          = mel_cc.to(device)
         expert_targets  = expert_targets.to(device)        # (B, 9)
-        _, _, _, q = model(mel_cc)                         # q: (B, 9)
+        _, _, _, q, _, _ = model(mel_cc)                   # q: (B, 9)
         cc_loss = F.mse_loss(q, expert_targets)
         losses['ccmusic'] = cc_loss * args.w_quality_mse
 
@@ -998,8 +1106,8 @@ def compute_quality_loss(model, quality_batch, device, args, epoch):
         mel_pro, mel_am = quality_batch['pairs']
         mel_pro = mel_pro.to(device)
         mel_am  = mel_am.to(device)
-        _, _, _, q_pro = model(mel_pro)    # (B, Q)
-        _, _, _, q_am  = model(mel_am)     # (B, Q)
+        _, _, _, q_pro, _, _ = model(mel_pro)    # (B, Q)
+        _, _, _, q_am,  _, _ = model(mel_am)     # (B, Q)
         # Use dim 0 (overall quality scalar) for ranking regardless of Q
         score_pro = q_pro[:, 0]            # (B,)
         score_am  = q_am[:, 0]             # (B,)
@@ -1070,7 +1178,8 @@ def _set_backbone_frozen(model, frozen: bool, probe_mode: bool = False,
 
 def train_one_epoch(model, loader, optimizer, scheduler, writer,
                     epoch, device, args, noise_pool=None,
-                    global_step_offset=0, quality_loaders=None):
+                    global_step_offset=0, quality_loaders=None,
+                    note_loader=None):
     """Train for one epoch.
 
     quality_loaders: dict returned by make_quality_loaders, or None/empty.
@@ -1080,7 +1189,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, writer,
     """
     model.train()
     running = {'total': 0.0, 'vad': 0.0, 'pitch': 0.0, 'technique': 0.0,
-               'contrastive': 0.0,
+               'note': 0.0, 'contrastive': 0.0,
                'quality_mse': 0.0, 'quality_ccmusic': 0.0, 'quality_ranking': 0.0}
     n_batches = 0
 
@@ -1143,6 +1252,13 @@ def train_one_epoch(model, loader, optimizer, scheduler, writer,
     else:
         # Standard pitch/VAD/technique training loop
         use_contrastive = getattr(args, 'contrastive_technique', False) and bool(getattr(args, 'technique_dirs', None))
+        use_note_head   = getattr(args, 'note_head', False)
+        # Warmup: zero out technique (and quality) loss for first N epochs
+        warmup_active = (getattr(args, 'warmup_heads_epochs', 0) > 0
+                         and epoch <= args.warmup_heads_epochs)
+
+        note_iter = iter(note_loader) if note_loader is not None else None
+
         for batch_idx, (mel, f0, vad, technique, has_technique) in enumerate(pbar):
             mel           = mel.to(device)
             f0            = f0.to(device)
@@ -1159,20 +1275,45 @@ def train_one_epoch(model, loader, optimizer, scheduler, writer,
                 mel = spec_augment(mel, args)
 
             if use_contrastive:
-                pred_vad, pred_pitch, pred_technique, _, embeddings = model(
+                pred_vad, pred_pitch, pred_technique, _, note_onset, note_offset, embeddings = model(
                     mel, return_embeddings=True)
             else:
-                pred_vad, pred_pitch, pred_technique, _ = model(mel)
+                pred_vad, pred_pitch, pred_technique, _, note_onset, note_offset = model(mel)
 
-            effective_w_technique = _get_w_technique(epoch, args)
-            total, vad_l, pitch_l, tech_l = compute_loss(
+            # Warmup: suppress technique loss until pitch/VAD/note have converged
+            effective_w_technique = 0.0 if warmup_active else _get_w_technique(epoch, args)
+
+            # Note targets — draw from note_loader if available, else zeros
+            if use_note_head:
+                if note_iter is not None:
+                    try:
+                        note_batch = next(note_iter)
+                    except StopIteration:
+                        note_iter = iter(note_loader)
+                        note_batch = next(note_iter)
+                    note_onset_tgt  = note_batch[0].to(device)  # (B, T)
+                    note_offset_tgt = note_batch[1].to(device)  # (B, T)
+                    has_note_batch  = note_batch[2].to(device)  # (B,)
+                else:
+                    B_n, T_n = mel.shape[0], mel.shape[1]
+                    note_onset_tgt  = torch.zeros(B_n, T_n, device=device)
+                    note_offset_tgt = torch.zeros(B_n, T_n, device=device)
+                    has_note_batch  = torch.zeros(B_n, device=device)
+            else:
+                note_onset_tgt = note_offset_tgt = has_note_batch = None
+
+            total, vad_l, pitch_l, tech_l, note_l = compute_loss(
                 pred_vad, pred_pitch, pred_technique,
                 vad, f0, technique, has_technique,
                 args, device,
                 w_technique_override=effective_w_technique,
+                note_onset=note_onset, note_offset=note_offset,
+                note_onset_target=note_onset_tgt,
+                note_offset_target=note_offset_tgt,
+                has_note=has_note_batch,
             )
 
-            if use_contrastive:
+            if use_contrastive and not warmup_active:
                 con_l = supcon_loss(
                     embeddings, technique, has_technique,
                     temperature=args.contrastive_temp,
@@ -1195,6 +1336,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, writer,
             running['vad']         += vad_l.item()
             running['pitch']       += pitch_l.item()
             running['technique']   += tech_l.item()
+            running['note']        += note_l.item()
             running['contrastive'] += con_l.item()
             n_batches += 1
 
@@ -1203,6 +1345,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, writer,
                 vad=f"{running['vad']/n_batches:.4f}",
                 pitch=f"{running['pitch']/n_batches:.4f}",
                 tech=f"{running['technique']/n_batches:.4f}",
+                **({"note": f"{running['note']/n_batches:.4f}"} if use_note_head else {}),
                 **({"con": f"{running['contrastive']/n_batches:.4f}"} if use_contrastive else {}),
             )
 
@@ -1248,7 +1391,7 @@ def evaluate(model, data_dir, technique_dirs, writer, epoch, device, args):
         clip_results = []
         for i in range(N):
             mel = torch.from_numpy(clips[i].astype(np.float32)).unsqueeze(0).to(device)
-            v, p, _, _ = model(mel)
+            v, p, _, _, _, _ = model(mel)
             pv = v.squeeze().cpu().numpy()
             pp = p.squeeze(0).cpu().numpy()
             T  = pv.shape[0]
@@ -1331,7 +1474,7 @@ def evaluate(model, data_dir, technique_dirs, writer, epoch, device, args):
                 continue
             mel_t = torch.from_numpy(clip_mel).unsqueeze(0).to(device)  # (1,T,40)
             with torch.no_grad():
-                _, _, pred_tech, _ = model(mel_t)
+                _, _, pred_tech, _, _, _ = model(mel_t)
             # Average over time for clip-level prediction
             pred_clip = pred_tech.squeeze(0).mean(0).cpu().numpy()   # (N_TECH,)
             all_pred.append(pred_clip)
@@ -1410,6 +1553,7 @@ def main():
     if args.n_heads  is not None: model_kwargs['n_heads']  = args.n_heads
     if args.deep_technique_head:  model_kwargs['deep_technique_head'] = True
     if quality_head_dim:          model_kwargs['quality_head'] = quality_head_dim
+    if args.note_head:            model_kwargs['note_head'] = True
     model = build_model(args.arch, **model_kwargs)
 
     start_epoch = 1
@@ -1450,10 +1594,43 @@ def main():
         quality_loaders = make_quality_loaders(args, args.seq_len, args.batch_size, args.num_workers)
         # Quality training doesn't need the main pitch/VAD/technique loader
         loader = None
+        pretrain_loader = None
     else:
+        # Dataset curriculum: build pretrain loader if --pretrain-data-dir is set
+        pretrain_loader = None
+        if args.pretrain_data_dir:
+            pretrain_tech = ([os.path.abspath(d) for d in args.pretrain_technique_dirs]
+                             if args.pretrain_technique_dirs else tech_dirs)
+            pretrain_loader = make_joint_loader(
+                os.path.abspath(args.pretrain_data_dir), pretrain_tech,
+                args.seq_len, args.batch_size, args.num_workers,
+                balance_datasets=args.balance_datasets)
+            print(f"Dataset curriculum: pretrain on {args.pretrain_data_dir} "
+                  f"for {args.pretrain_epochs} epochs, then switch to main dataset.")
         loader = make_joint_loader(data_dir, tech_dirs, args.seq_len,
                                    args.batch_size, args.num_workers,
                                    balance_datasets=args.balance_datasets)
+
+    # Note loader — separate DataLoader for --note-dirs (Variant 4)
+    note_loader = None
+    if args.note_head and args.note_dirs:
+        from torch.utils.data import ConcatDataset
+        note_dirs_abs = [os.path.abspath(d) for d in args.note_dirs]
+        note_datasets = []
+        for nd in note_dirs_abs:
+            note_path = os.path.join(nd, "note_train.npz")
+            if os.path.exists(note_path):
+                note_datasets.append(NoteDataset(nd, args.seq_len))
+            else:
+                print(f"  [warn] note_train.npz not found in {nd} — skipping")
+        if note_datasets:
+            note_ds = ConcatDataset(note_datasets) if len(note_datasets) > 1 else note_datasets[0]
+            note_loader = DataLoader(note_ds, batch_size=args.batch_size, shuffle=True,
+                                     drop_last=True, num_workers=args.num_workers,
+                                     pin_memory=True,
+                                     persistent_workers=(args.num_workers > 0))
+            print(f"Note loader: {len(note_datasets)} source(s), "
+                  f"{len(note_ds)} samples/epoch")
 
     # Optimizer + scheduler
     # Split into two param groups when --lr-backbone is set so the backbone
@@ -1533,18 +1710,37 @@ def main():
 
     ref_loader_len = len(quality_loaders.get('pairs', loader)) if quality_loaders else len(loader)
 
+    # Warmup notification
+    if getattr(args, 'warmup_heads_epochs', 0) > 0:
+        print(f"  Head warmup: technique/quality losses suppressed for epochs "
+              f"{start_epoch}–{start_epoch + args.warmup_heads_epochs - 1}")
+
     for epoch in range(start_epoch, start_epoch + args.epochs):
         if (args.quality_variant == 0 and not args.probe_mode
                 and args.freeze_backbone_epochs > 0 and epoch == freeze_until):
             _set_backbone_frozen(model, frozen=False)
             print(f"  Epoch {epoch}: backbone unfrozen — joint fine-tuning begins")
 
+        # Dataset curriculum: use pretrain_loader for first --pretrain-epochs epochs
+        if (pretrain_loader is not None
+                and (epoch - start_epoch) < args.pretrain_epochs):
+            active_loader = pretrain_loader
+            if (epoch - start_epoch) == 0:
+                print(f"  Epoch {epoch}: curriculum pretrain phase "
+                      f"({args.pretrain_epochs} epochs on {args.pretrain_data_dir})")
+        else:
+            active_loader = loader
+            if (pretrain_loader is not None
+                    and (epoch - start_epoch) == args.pretrain_epochs):
+                print(f"  Epoch {epoch}: curriculum switches to main dataset")
+
         t0 = time.time()
         train_loss, train_losses = train_one_epoch(
-            model, loader, optimizer, scheduler, writer,
+            model, active_loader, optimizer, scheduler, writer,
             epoch, device, args, noise_pool=noise_pool,
             global_step_offset=global_step,
             quality_loaders=quality_loaders if args.quality_variant > 0 else None,
+            note_loader=note_loader,
         )
         global_step += ref_loader_len
 
@@ -1558,10 +1754,13 @@ def main():
                   f"  mse={train_losses.get('quality_mse', 0):.4f}"
                   f"  ccmusic={train_losses.get('quality_ccmusic', 0):.4f})")
         else:
+            note_str = (f"  note={train_losses['note']:.4f}"
+                        if getattr(args, 'note_head', False) else "")
             print(f"  Epoch {epoch} — {dt:.1f}s — loss={train_loss:.5f}"
                   f"  (vad={train_losses['vad']:.4f}"
                   f"  pitch={train_losses['pitch']:.4f}"
-                  f"  tech={train_losses['technique']:.4f})")
+                  f"  tech={train_losses['technique']:.4f}"
+                  f"{note_str})")
 
         # Checkpoint every epoch
         ckpt = {
