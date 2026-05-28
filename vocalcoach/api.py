@@ -7,32 +7,34 @@ coaching report JSON + optional LLM critique.
 
 Endpoints
 ---------
-  POST /analyse          — full offline analysis (feature extraction + model inference)
-  POST /analyse/critique — same + LLM natural-language critique appended
-  GET  /health           — liveness check
+  POST /analyse                  — full offline analysis
+  POST /analyse/critique         — same + LLM natural-language critique
+  GET  /health                   — liveness check
+  POST /sessions/{song_id}       — save a take + return progress diff
+  GET  /sessions/{song_id}       — list all takes for a song
+  GET  /sessions                 — list all song names
+  DELETE /sessions/{song_id}/{n} — delete take n
+
+Sessions are stored as JSON files under VOCALCOACH_SESSIONS_DIR
+(default: ./vocalcoach_sessions/).  Each song gets one file:
+    {song_id}.json  →  {"song_id": "...", "takes": [...report dicts...]}
 
 Usage
 -----
-    # Start server (from repo root):
     uvicorn vocalcoach.api:app --host 0.0.0.0 --port 8000 --reload
-
-    # Client:
-    curl -X POST http://localhost:8000/analyse \
-         -F "audio=@recording.wav" \
-         -F "reference=@reference.wav"   # optional
 
 Dependencies
 ------------
     pip install fastapi uvicorn python-multipart soundfile
-
-Model checkpoint is loaded once at startup from VOCALCOACH_CHECKPOINT env var
-(or --checkpoint CLI arg when launching directly).
 """
 
 import io
+import json
 import os
+import re
 import tempfile
 import traceback
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -46,15 +48,17 @@ except ImportError:
 try:
     from fastapi import FastAPI, File, Form, HTTPException, UploadFile
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, FileResponse
+    from fastapi.staticfiles import StaticFiles
     _HAS_FASTAPI = True
 except ImportError:
     _HAS_FASTAPI = False
-    # Dummy so module can be imported for type-checking / testing without FastAPI
     class FastAPI:  # type: ignore
         def __init__(self, **kw): pass
         def post(self, *a, **kw): return lambda f: f
         def get(self, *a, **kw): return lambda f: f
+        def delete(self, *a, **kw): return lambda f: f
+        def mount(self, *a, **kw): pass
         def add_middleware(self, *a, **kw): pass
 
 import torch
@@ -81,6 +85,100 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Static UI ───────────────────────────────────────────────────────────────
+
+_UI_DIR = Path(__file__).parent / "ui"
+if _UI_DIR.exists() and _HAS_FASTAPI:
+    app.mount("/ui", StaticFiles(directory=str(_UI_DIR), html=True), name="ui")
+
+# ── Sessions (JSON file store) ───────────────────────────────────────────────
+
+_SESSIONS_DIR = Path(os.environ.get("VOCALCOACH_SESSIONS_DIR", "./vocalcoach_sessions"))
+
+
+def _sessions_dir() -> Path:
+    d = _SESSIONS_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _slug(song_id: str) -> str:
+    """Safe filename slug from a song name."""
+    return re.sub(r"[^\w\-]", "_", song_id.strip())[:80]
+
+
+def _session_path(song_id: str) -> Path:
+    return _sessions_dir() / f"{_slug(song_id)}.json"
+
+
+def _load_session(song_id: str) -> dict:
+    p = _session_path(song_id)
+    if p.exists():
+        return json.loads(p.read_text())
+    return {"song_id": song_id, "takes": []}
+
+
+def _save_session(data: dict) -> None:
+    p = _session_path(data["song_id"])
+    p.write_text(json.dumps(data, indent=2, default=str))
+
+
+def _diff_takes(prev: dict, curr: dict) -> dict:
+    """Return a human-readable delta between two coaching reports."""
+    out = {}
+
+    def _safe(report, *path):
+        node = report
+        for k in path:
+            if not isinstance(node, dict):
+                return None
+            node = node.get(k)
+        if isinstance(node, float) and (node != node):  # nan
+            return None
+        return node
+
+    METRICS = [
+        ("Overall score",       ["coaching", "overall_score"],          True,  None),
+        ("Pitch stability",     ["pitch", "f0_stability_std_hz"],       False, "¢ std"),
+        ("Vibrato coverage",    ["vibrato", "phrase_fraction"],         True,  "%"),
+        ("Vibrato rate",        ["vibrato", "rate_hz_mean"],            None,  "Hz"),
+        ("DTW deviation",       ["reference_comparison", "mean_deviation_cents"], False, "¢"),
+        ("MOS quality",         ["mos", "score"],                       True,  "/5"),
+    ]
+    for label, path, higher_better, unit in METRICS:
+        pv = _safe(prev, *path)
+        cv = _safe(curr, *path)
+        if pv is None or cv is None:
+            continue
+        if label == "Pitch stability":
+            # convert Hz std → cents (approximate for small deviations)
+            f0 = _safe(curr, "pitch", "f0_mean_hz") or 220.0
+            import math
+            pv = round(abs(1200 * math.log2((f0 + pv) / f0)), 1)
+            cv = round(abs(1200 * math.log2((f0 + cv) / f0)), 1)
+        if label == "Vibrato coverage":
+            pv = round(pv * 100, 1)
+            cv = round(cv * 100, 1)
+        delta = round(cv - pv, 2) if isinstance(cv, (int, float)) else None
+        if delta is None:
+            continue
+        direction = None
+        if higher_better is True:
+            direction = "improved" if delta > 0 else ("regressed" if delta < 0 else "unchanged")
+        elif higher_better is False:
+            direction = "improved" if delta < 0 else ("regressed" if delta > 0 else "unchanged")
+        else:
+            direction = "changed"
+        out[label] = {
+            "previous": pv,
+            "current": cv,
+            "delta": delta,
+            "direction": direction,
+            "unit": unit or "",
+        }
+    return out
+
 
 # ── Model singleton ─────────────────────────────────────────────────────────
 
@@ -183,8 +281,7 @@ def _run_model(y: np.ndarray) -> dict:
     mel_t = torch.tensor(mel_db.T[None], dtype=torch.float32).to(_device)
 
     with torch.no_grad():
-        # Returns (vad, pitch, technique, quality) — all already sigmoid'd
-        out_vad, out_pitch, out_technique, _ = _model(mel_t)
+        out_vad, out_pitch, out_technique, _, _, _ = _model(mel_t)
 
     # (B, T, 1) → (T,)
     vad = out_vad.squeeze(0).squeeze(-1).cpu().numpy()
@@ -203,12 +300,27 @@ def _run_model(y: np.ndarray) -> dict:
     pitch_bin = np.argmax(pitch_post, axis=-1).astype(float)  # (T,)
     f0_hz = np.where(voiced_mask, bin_to_f0(pitch_bin), 0.0).astype(np.float32)
 
-    # Also expose a calibrated VAD: prefer model VAD if it fires, else fall
-    # back to pitch confidence voicing so downstream features work correctly.
+    # Calibrate VAD: three failure modes seen across checkpoints:
+    #   1. VAD near-zero everywhere (head not trained, stage1) → fall back to
+    #      pitch confidence, but use a stricter absolute threshold so only
+    #      genuinely confident pitch frames count as voiced.
+    #   2. VAD saturated high everywhere (stage2 overfit) → the model thinks
+    #      the whole clip is voiced; fall back to pitch confidence mask.
+    #   3. VAD fires normally → use as-is, clipped to [0,1].
+    vad_range = float(vad.max() - vad.min())
+    pc_thresh = max(0.15, float(pitch_confidence.max()) * 0.35)
     if vad.max() < 0.1:
-        vad = voiced_mask.astype(np.float32)
+        # Case 1: dead VAD head (stage1) — use pitch confidence
+        vad = (pitch_confidence > pc_thresh).astype(np.float32)
+    elif vad_range < 0.05 or vad.min() > 0.6:
+        # Case 2: saturated — no silence/voice discrimination at all.
+        # vad_range < 0.05: flat (all same value).
+        # vad.min() > 0.6: shifted high (stage2 overfit, min=0.76).
+        # Both cases: fall back to pitch confidence.
+        vad = (pitch_confidence > pc_thresh).astype(np.float32)
+    # Case 3: VAD has meaningful dynamic range → use as-is
 
-    result = {"f0_hz": f0_hz, "vad": vad}
+    result = {"f0_hz": f0_hz, "vad": vad, "mel_db": mel_db, "pitch_post": pitch_post}
 
     if out_technique is not None:
         # (B, T, N) → (T, N) — already sigmoid'd
@@ -219,7 +331,8 @@ def _run_model(y: np.ndarray) -> dict:
 
 # ── Core analysis pipeline ───────────────────────────────────────────────────
 
-def _analyse(y: np.ndarray, y_ref: Optional[np.ndarray] = None) -> dict:
+def _analyse(y: np.ndarray, y_ref: Optional[np.ndarray] = None,
+             return_arrays: bool = False) -> dict:
     """Full pipeline: model → features → phrase aggregation → report."""
     model_out = _run_model(y)
     f0_hz = model_out["f0_hz"]
@@ -273,6 +386,14 @@ def _analyse(y: np.ndarray, y_ref: Optional[np.ndarray] = None) -> dict:
     if population_context:
         report["population_context"] = population_context
 
+    if return_arrays:
+        report["_arrays"] = {
+            "mel_db":     model_out["mel_db"],      # (40, T) float32
+            "pitch_post": model_out["pitch_post"],  # (T, 360) float32
+            "vad":        vad,                      # (T,) float32
+            "f0_hz":      f0_hz,                    # (T,) float32
+        }
+
     return report
 
 
@@ -324,6 +445,45 @@ async def analyse(
         raise HTTPException(status_code=500, detail=traceback.format_exc())
 
 
+@app.post("/analyse/arrays")
+async def analyse_arrays(
+    audio: UploadFile = File(..., description="Singing audio file (WAV/MP3/FLAC)"),
+):
+    """Return mel spectrogram + pitch posteriorgram + VAD + F0 as base64-encoded float32 arrays.
+
+    Response JSON:
+        mel_db:     base64 float32, shape (40, T)  — log-mel, row-major
+        pitch_post: base64 float32, shape (T, 360) — pitch posteriorgram, row-major
+        vad:        base64 float32, shape (T,)
+        f0_hz:      base64 float32, shape (T,)
+        T:          int — number of time frames
+    """
+    import base64
+    try:
+        y = _load_audio(await audio.read())
+        report = _analyse(y, return_arrays=True)
+        arrays = report.pop("_arrays", {})
+
+        def enc(arr):
+            return base64.b64encode(np.ascontiguousarray(arr).tobytes()).decode()
+
+        mel = arrays["mel_db"]    # (40, T)
+        pit = arrays["pitch_post"]  # (T, 360)
+        T   = mel.shape[1]
+
+        return JSONResponse(content={
+            "T":          T,
+            "mel_db":     enc(mel),
+            "pitch_post": enc(pit),
+            "vad":        enc(arrays["vad"]),
+            "f0_hz":      enc(arrays["f0_hz"]),
+        })
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail=traceback.format_exc())
+
+
 @app.post("/analyse/critique")
 async def analyse_with_critique(
     audio: UploadFile = File(..., description="Singing audio file"),
@@ -350,6 +510,101 @@ async def analyse_with_critique(
         raise HTTPException(status_code=503, detail=str(e))
     except Exception:
         raise HTTPException(status_code=500, detail=traceback.format_exc())
+
+
+# ── Sessions endpoints ────────────────────────────────────────────────────
+
+@app.get("/sessions")
+async def list_songs():
+    """List all song IDs that have saved sessions."""
+    songs = []
+    for p in sorted(_sessions_dir().glob("*.json")):
+        try:
+            data = json.loads(p.read_text())
+            songs.append({
+                "song_id": data.get("song_id", p.stem),
+                "n_takes": len(data.get("takes", [])),
+                "last_score": (data["takes"][-1].get("coaching", {}) or {}).get("overall_score")
+                              if data.get("takes") else None,
+            })
+        except Exception:
+            pass
+    return JSONResponse(content=songs)
+
+
+@app.get("/sessions/{song_id}")
+async def get_session(song_id: str):
+    """Return all takes for a song."""
+    data = _load_session(song_id)
+    return JSONResponse(content=_sanitize(data))
+
+
+@app.post("/sessions/{song_id}")
+async def save_take(
+    song_id: str,
+    audio: UploadFile = File(..., description="Singing audio (WAV/MP3/FLAC)"),
+    reference: Optional[UploadFile] = File(None, description="Reference audio for DTW"),
+):
+    """Analyse audio, save as a new take for song_id, return report + progress diff."""
+    try:
+        y = _load_audio(await audio.read())
+        y_ref = _load_audio(await reference.read()) if reference else None
+
+        report = _analyse(y, y_ref)
+        report["coaching"] = score_report(report)
+
+        session = _load_session(song_id)
+        session["song_id"] = song_id
+
+        prev_take = session["takes"][-1] if session["takes"] else None
+        take_number = len(session["takes"]) + 1
+        report["take_number"] = take_number
+
+        progress_diff = _diff_takes(prev_take, report) if prev_take else {}
+
+        session["takes"].append(report)
+        _save_session(session)
+
+        return JSONResponse(content=_sanitize({
+            "song_id": song_id,
+            "take_number": take_number,
+            "report": report,
+            "progress_diff": progress_diff,
+            "all_scores": [
+                t.get("coaching", {}).get("overall_score") for t in session["takes"]
+            ],
+        }))
+
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail=traceback.format_exc())
+
+
+@app.delete("/sessions/{song_id}/{take_n}")
+async def delete_take(song_id: str, take_n: int):
+    """Delete take number take_n (1-indexed) from a session."""
+    session = _load_session(song_id)
+    takes = session.get("takes", [])
+    if take_n < 1 or take_n > len(takes):
+        raise HTTPException(status_code=404, detail=f"Take {take_n} not found")
+    takes.pop(take_n - 1)
+    # Renumber
+    for i, t in enumerate(takes):
+        t["take_number"] = i + 1
+    session["takes"] = takes
+    _save_session(session)
+    return {"deleted": take_n, "remaining": len(takes)}
+
+
+# ── UI redirect ────────────────────────────────────────────────────────────
+
+@app.get("/")
+async def root():
+    ui_path = _UI_DIR / "index.html"
+    if ui_path.exists():
+        return FileResponse(str(ui_path))
+    return {"message": "VocalCoach API running. UI not found at vocalcoach/ui/index.html"}
 
 
 # ── Direct launch ─────────────────────────────────────────────────────────
