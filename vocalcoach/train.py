@@ -161,7 +161,10 @@ parser.add_argument("--n-blocks", type=int, default=None,
 parser.add_argument("--n-layers", type=int, default=None,
                     help="number of Conformer blocks (default: 4); Conformer only")
 parser.add_argument("--n-heads", type=int, default=None,
-                    help="number of attention heads for Conformer (default: 4); must divide --hidden evenly")
+                    help="number of attention heads for Conformer or TCN attn layers (default: 4); must divide --hidden evenly")
+parser.add_argument("--n-attn-layers", type=int, default=None,
+                    help="number of self-attention layers appended after the TCN stack (TCN arch only, default: 0 = pure TCN). "
+                         "1-2 layers add global context for VAD while keeping the TCN local conv backbone.")
 parser.add_argument("--deep-technique-head", action="store_true",
                     help="replace the single Linear technique head with a 2-layer MLP "
                          "(Linear→GELU→Dropout→Linear). Recommended with --probe-mode "
@@ -345,12 +348,15 @@ parser.add_argument("--patience", type=int, default=0,
                     help="stop if best metric does not improve for N epochs "
                          "(0 = disabled)")
 parser.add_argument("--metric-vdr-weight", type=float, default=1.0,
-                    help="relative weight of VDR_clean vs F1/RPA in the compound "
-                         "checkpoint metric: score = primary + w * vdr_clean. "
+                    help="relative weight of vF1_clean vs F1/RPA in the compound "
+                         "checkpoint metric: score = primary + w * vf1_clean. "
+                         "vF1 (harmonic mean of VAD precision and recall) replaces raw VDR "
+                         "because it penalizes both missed voiced frames and false alarms, "
+                         "preventing dead/saturated VAD heads from gaming the metric. "
                          "Default 1.0 = equal additive weight. "
-                         "Increase (e.g. 2.0) to penalize VDR regression more heavily; "
-                         "decrease (e.g. 0.5) to prioritize F1/RPA; "
-                         "0.0 = track F1/RPA only.")
+                         "Increase (e.g. 2.0) to weight VAD quality more heavily; "
+                         "decrease (e.g. 0.5) to prioritize pitch F1/RPA; "
+                         "0.0 = track pitch F1/RPA only.")
 
 # Gradient clipping
 parser.add_argument("--grad-clip", type=float, default=5.0)
@@ -1593,9 +1599,10 @@ def main():
     quality_head_dim = {0: 0, 1: 1, 2: 9, 3: 1}[args.quality_variant]
     model_kwargs = dict(causal=args.causal)
     if args.hidden   is not None: model_kwargs['hidden']   = args.hidden
-    if args.n_blocks is not None: model_kwargs['n_blocks'] = args.n_blocks
-    if args.n_layers is not None: model_kwargs['n_layers'] = args.n_layers
-    if args.n_heads  is not None: model_kwargs['n_heads']  = args.n_heads
+    if args.n_blocks     is not None: model_kwargs['n_blocks']     = args.n_blocks
+    if args.n_layers     is not None: model_kwargs['n_layers']     = args.n_layers
+    if args.n_heads      is not None: model_kwargs['n_heads']      = args.n_heads
+    if args.n_attn_layers is not None: model_kwargs['n_attn_layers'] = args.n_attn_layers
     if args.deep_technique_head:  model_kwargs['deep_technique_head'] = True
     if quality_head_dim:          model_kwargs['quality_head'] = quality_head_dim
     if args.note_head:            model_kwargs['note_head'] = True
@@ -1842,18 +1849,20 @@ def main():
                 eval_res = evaluate(model, eval_dir, tech_dirs,
                                     writer, epoch, device, args)
                 if 'macro_f1' in eval_res:
-                    vdr_clean = eval_res.get('vdr_clean', 1.0)
+                    vf1_clean = eval_res.get('vf1_clean', 1.0)
                     w = args.metric_vdr_weight
-                    metric = eval_res['macro_f1'] + w * vdr_clean
-                    metric_name = f"f1+{w}*vdr"
+                    metric = eval_res['macro_f1'] + w * vf1_clean
+                    metric_name = f"f1+{w}*vf1"
                 elif 'macro_rpa' in eval_res:
-                    # Use RPA + w*VDR_clean so the checkpoint reflects both pitch
-                    # accuracy and voice detection — RPA alone barely varies and
-                    # picks early epochs where VDR is still low.
-                    vdr_clean = eval_res.get('vdr_clean', 1.0)
+                    # Use RPA + w*vF1_clean so the checkpoint reflects both pitch
+                    # accuracy and VAD quality. vF1 balances VAD precision and
+                    # recall, preventing dead/saturated VAD heads from gaming the
+                    # metric (high VDR alone could be achieved by predicting all
+                    # frames as voiced; vF1 penalizes the resulting false alarms).
+                    vf1_clean = eval_res.get('vf1_clean', 1.0)
                     w = args.metric_vdr_weight
-                    metric = eval_res['macro_rpa'] + w * vdr_clean
-                    metric_name = f"rpa+{w}*vdr"
+                    metric = eval_res['macro_rpa'] + w * vf1_clean
+                    metric_name = f"rpa+{w}*vf1"
                 else:
                     metric = float('nan')
                     metric_name = "none"

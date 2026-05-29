@@ -342,7 +342,8 @@ class VocalCoachTCN(nn.Module):
 
     def __init__(self, n_mels=N_MELS, hidden=128, n_blocks=8, kernel_size=3,
                  causal=True, dropout=0.1, n_techniques=N_TECHNIQUES,
-                 quality_head=0, deep_technique_head=False, note_head=False):
+                 quality_head=0, deep_technique_head=False, note_head=False,
+                 n_attn_layers=0, n_heads=4):
         super().__init__()
         self.causal  = causal
         self.hidden  = hidden
@@ -359,6 +360,20 @@ class VocalCoachTCN(nn.Module):
                      causal=causal, dropout=dropout)
             for i in range(n_blocks)
         ])
+
+        # Optional self-attention layers after the TCN stack. Each layer is a
+        # standard pre-norm MultiheadAttention + residual. This gives the TCN
+        # global context for VAD decisions without replacing the local conv
+        # backbone. n_attn_layers=0 (default) preserves the original TCN.
+        self.attn_layers = nn.ModuleList()
+        for _ in range(n_attn_layers):
+            self.attn_layers.append(nn.ModuleDict({
+                'norm': nn.LayerNorm(hidden),
+                'attn': nn.MultiheadAttention(hidden, n_heads,
+                                              dropout=dropout, batch_first=True),
+                'drop': nn.Dropout(dropout),
+            }))
+
         self.norm = nn.LayerNorm(hidden)
 
         # ── Output heads (multi-task) ──
@@ -401,8 +416,9 @@ class VocalCoachTCN(nn.Module):
 
         self._init_weights()
         n = sum(p.numel() for p in self.parameters())
+        attn_str = f", attn={n_attn_layers}×{n_heads}h" if n_attn_layers else ""
         print(f"VocalCoachTCN: {n:,} parameters "
-              f"(hidden={hidden}, blocks={n_blocks}, causal={causal}"
+              f"(hidden={hidden}, blocks={n_blocks}, causal={causal}{attn_str}"
               f"{', note_head=True' if note_head else ''}"
               f"{f', quality_head={quality_head}' if quality_head else ''})")
 
@@ -433,6 +449,19 @@ class VocalCoachTCN(nn.Module):
 
         for block in self.blocks:
             x = block(x)
+
+        for layer in self.attn_layers:
+            h = layer['norm'](x)
+            if self.causal:
+                T = x.size(1)
+                mask = torch.triu(
+                    torch.ones(T, T, device=x.device, dtype=torch.bool),
+                    diagonal=1)
+            else:
+                mask = None
+            h, _ = layer['attn'](h, h, h, attn_mask=mask)
+            x = x + layer['drop'](h)
+
         x = self.norm(x)
 
         vad       = torch.sigmoid(self.head_vad(x))        # (B, T, 1)
