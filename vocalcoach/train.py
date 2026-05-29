@@ -364,6 +364,11 @@ parser.add_argument("--augment", type=str, default="none",
 parser.add_argument("--noise-dir", type=str, default=None,
                     help="directory containing noise.npz "
                          "(defaults to --data-dir if not set)")
+parser.add_argument("--eval-dir", type=str, default=None,
+                    help="directory containing test.npz for eval "
+                         "(defaults to --data-dir if not set). "
+                         "Use when --data-dir points to a subdirectory "
+                         "like merged_pitchvad/ that lacks test.npz.")
 parser.add_argument("--snr-range", type=float, nargs=2, default=[-10.0, 30.0],
                     help="min/max SNR in dB for noise mixing")
 parser.add_argument("--p-clean", type=float, default=0.0,
@@ -1537,6 +1542,13 @@ def main():
     print(f"Device: {device}  |  Arch: {args.arch}  |  causal={args.causal}")
 
     data_dir     = os.path.abspath(args.data_dir) if args.data_dir else None
+    # eval_dir: explicit > data_dir > parent of data_dir (covers merged_pitchvad/ case)
+    if args.eval_dir:
+        eval_dir = os.path.abspath(args.eval_dir)
+    elif data_dir and not os.path.exists(os.path.join(data_dir, "test.npz")):
+        eval_dir = os.path.dirname(data_dir)
+    else:
+        eval_dir = data_dir
     tech_dirs    = [os.path.abspath(d) for d in args.technique_dirs] \
                    if args.technique_dirs else []
     output_dir   = os.path.abspath(args.output_dir)
@@ -1583,8 +1595,14 @@ def main():
     # Noise pool (loaded once; drawn per-batch in training loop)
     noise_pool = None
     if args.augment != "none":
-        noise_dir = (os.path.abspath(args.noise_dir) if args.noise_dir
-                     else data_dir)
+        if args.noise_dir:
+            noise_dir = os.path.abspath(args.noise_dir)
+        elif data_dir and os.path.exists(os.path.join(data_dir, "noise.npz")):
+            noise_dir = data_dir
+        elif data_dir and os.path.exists(os.path.join(os.path.dirname(data_dir), "noise.npz")):
+            noise_dir = os.path.dirname(data_dir)
+        else:
+            noise_dir = data_dir  # will raise a clear error in NoisePool
         if noise_dir is None:
             raise RuntimeError(
                 "--augment requires noise.npz: pass --noise-dir or --data-dir")
@@ -1793,7 +1811,7 @@ def main():
                 metric_name = "neg_ranking_loss"
                 eval_res = {'neg_ranking_loss': metric}
             else:
-                eval_res = evaluate(model, data_dir, tech_dirs,
+                eval_res = evaluate(model, eval_dir, tech_dirs,
                                     writer, epoch, device, args)
                 if 'macro_f1' in eval_res:
                     vdr_clean = eval_res.get('vdr_clean', 1.0)
