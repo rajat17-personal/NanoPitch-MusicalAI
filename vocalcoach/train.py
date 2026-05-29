@@ -1408,6 +1408,20 @@ def evaluate(model, data_dir, technique_dirs, writer, epoch, device, args):
             vp = f0d > 0
             vdr = float(np.mean(vp[vg])) if vg.sum() > 0 else float('nan')
             vad_acc = float(np.mean((vp > 0) == (vg > 0)))
+            # Voicing F1: harmonic mean of precision and recall (VDR).
+            # More balanced than VDR alone (ignores false alarms) or VAD Acc
+            # (dominated by the majority silence class when silence >> voiced).
+            tp = int((vp & vg).sum())
+            fp = int((vp & ~vg).sum())
+            fn = int((~vp & vg).sum())
+            prec = tp / (tp + fp) if (tp + fp) > 0 else float('nan')
+            rec  = tp / (tp + fn) if (tp + fn) > 0 else float('nan')
+            if not (np.isnan(prec) or np.isnan(rec)) and (prec + rec) > 0:
+                vf1 = float(2 * prec * rec / (prec + rec))
+            else:
+                vf1 = float('nan')
+            tn = int((~vp & ~vg).sum())
+            vfa = float(fp / (fp + tn)) if (fp + tn) > 0 else float('nan')
             both = vg & vp
             if both.sum() > 0:
                 ce = np.abs(1200 * np.log2(
@@ -1415,7 +1429,8 @@ def evaluate(model, data_dir, technique_dirs, writer, epoch, device, args):
                 rpa = float(np.mean(ce < 50))
             else:
                 rpa = float('nan')
-            clip_results.append({'snr': float(snrs[i]), 'vdr': vdr, 'rpa': rpa, 'vad_acc': vad_acc})
+            clip_results.append({'snr': float(snrs[i]), 'vdr': vdr, 'rpa': rpa,
+                                  'vad_acc': vad_acc, 'vf1': vf1, 'vfa': vfa})
 
         by_snr = {}
         for r in clip_results:
@@ -1425,31 +1440,44 @@ def evaluate(model, data_dir, technique_dirs, writer, epoch, device, args):
             v = [x for x in vals if not np.isnan(x)]
             return float(np.mean(v)) if v else float('nan')
 
-        print(f"\n  {'Condition':<10}  {'VAD Acc':>8}  {'VDR':>8}  {'RPA':>8}")
-        print(f"  {'─'*10}  {'─'*8}  {'─'*8}  {'─'*8}")
-        rpa_values = []
+        print(f"\n  {'Condition':<10}  {'VAD Acc':>8}  {'VDR':>8}  {'VFA↓':>8}  {'vF1':>8}  {'RPA':>8}")
+        print(f"  {'─'*10}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}")
+        rpa_values, vf1_values = [], []
         for snr in sorted(by_snr.keys(), key=lambda x: x if np.isfinite(x) else 1e6):
             c    = by_snr[snr]
             tag  = "clean" if not np.isfinite(snr) else f"{snr:+.0f} dB"
             va   = smean([x['vad_acc'] for x in c])
             vd   = smean([x['vdr'] for x in c])
+            vf   = smean([x['vf1'] for x in c])
+            vfar = smean([x['vfa'] for x in c])
             rp   = smean([x['rpa'] for x in c])
-            print(f"  {tag:<10}  {va:8.1%}  {vd:8.1%}  {rp:8.1%}")
+            print(f"  {tag:<10}  {va:8.1%}  {vd:8.1%}  {vfar:8.1%}  {vf:8.1%}  {rp:8.1%}")
             if not np.isnan(rp):
                 rpa_values.append(rp)
+            if not np.isnan(vf):
+                vf1_values.append(vf)
             stag = tag.replace(' ', '').replace('+', 'p').replace('-', 'n')
             writer.add_scalar(f"eval/vad_acc_{stag}", va, epoch)
             writer.add_scalar(f"eval/vdr_{stag}", vd, epoch)
+            writer.add_scalar(f"eval/vfa_{stag}", vfar, epoch)
+            writer.add_scalar(f"eval/vf1_{stag}", vf, epoch)
             writer.add_scalar(f"eval/rpa_{stag}", rp, epoch)
             if not np.isfinite(snr) and not np.isnan(vd):
                 results['vdr_clean'] = vd
             if not np.isfinite(snr) and not np.isnan(va):
                 results['vad_acc_clean'] = va
+            if not np.isfinite(snr) and not np.isnan(vf):
+                results['vf1_clean'] = vf
+            if not np.isfinite(snr) and not np.isnan(vfar):
+                results['vfa_clean'] = vfar
 
         macro_rpa = float(np.mean(rpa_values)) if rpa_values else float('nan')
+        macro_vf1 = float(np.mean(vf1_values)) if vf1_values else float('nan')
         results['macro_rpa'] = macro_rpa
+        results['macro_vf1'] = macro_vf1
         writer.add_scalar("eval/macro_rpa", macro_rpa, epoch)
-        print(f"  Macro RPA: {macro_rpa:.4f}")
+        writer.add_scalar("eval/macro_vf1", macro_vf1, epoch)
+        print(f"  Macro RPA: {macro_rpa:.1%}  |  Macro vF1: {macro_vf1:.1%}")
 
     # ── Technique F1 evaluation ──────────────────────────────────────────
     # Collect test files from all technique dirs and merge them so that

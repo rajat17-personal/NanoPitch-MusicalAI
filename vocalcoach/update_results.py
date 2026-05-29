@@ -30,6 +30,7 @@ Usage
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -239,10 +240,11 @@ def run_evaluate(ckpt_path, data_dir, technique_dir, label="", voicing_threshold
 
     cmd = [sys.executable, "-u", script,
            "--checkpoint", ckpt_path,
-           "--data-dir",   data_dir,
            "--json",       json_path,
            "--voicing-threshold", str(voicing_threshold),
            "--onset-penalty", str(onset_penalty)]
+    if data_dir:
+        cmd += ["--data-dir", data_dir]
     if technique_dir:
         cmd += ["--technique-dir", technique_dir]
 
@@ -285,10 +287,6 @@ def extract_technique(ev, key="technique"):
 
 def extract_overall(ev):
     pitch = ev.get("pitch", {})
-    # Use the last condition group's overall — this is overall across conditions
-    # (the evaluate.py does not emit a single 'overall'; use macro_rpa as the
-    # summary, and derive vad/vdr/med from the condition dicts directly).
-    # Average across all conditions for the summary columns.
     import numpy as np
     conds = [pitch[c] for c in CONDITIONS if c in pitch]
     def avg(key):
@@ -298,6 +296,8 @@ def extract_overall(ev):
         "vad_acc": avg("vad_acc"),
         "rt_rpa":  avg("rpa"),
         "rt_vdr":  avg("vdr"),
+        "rt_vf1":  avg("vf1"),
+        "rt_vfa":  avg("vfa"),
         "rt_med":  avg("median_cents"),
     }
 
@@ -388,13 +388,13 @@ def _extract_baseline(path):
         m = DATA_ROW_RE.match(row)
         if m and m.group(1) == "baseline":
             cells = [c.strip() for c in row.strip().strip("|").split("|")]
-            # cells: [num, name, arch, key_args, note, vad, rpa, vdr, med, mf1, map]
+            # cells: [num, name, arch, key_args, note, vad, rpa, vdr, vf1, med, mf1, map]
             if len(cells) >= 9:
                 return {
                     "vad":    _parse_num(cells[5]),
                     "rt_rpa": _parse_num(cells[6]),
                     "rt_vdr": _parse_num(cells[7]),
-                    "rt_med": _parse_num(cells[8]),
+                    "rt_med": _parse_num(cells[9]) if len(cells) > 9 else _parse_num(cells[8]),
                 }
     return None
 
@@ -448,6 +448,12 @@ def _arch_cell(ckpt_args, ckpt):
     return f"{arch}/{c_str}"
 
 
+def _pct(v, decimals=1):
+    """Format a [0,1] fraction as a percentage string, or '—' if nan/None."""
+    if v is None or math.isnan(v): return "—"
+    return f"{v*100:.{decimals}f}"
+
+
 def make_runs_row(num, name, arch_cell, args_diff, note,
                   overall, tech, baseline=None):
     ka = ", ".join(args_diff) if args_diff else "defaults"
@@ -456,23 +462,27 @@ def make_runs_row(num, name, arch_cell, args_diff, note,
     vad_s = _delta(overall["vad_acc"] * 100, b.get("vad"))
     rpa_s = _delta(overall["rt_rpa"]  * 100, b.get("rt_rpa"))
     vdr_s = _delta(overall["rt_vdr"]  * 100, b.get("rt_vdr"))
+    vf1_s = _pct(overall.get("rt_vf1"))
+    vfa_s = _pct(overall.get("rt_vfa"))
     med_s = _delta(overall["rt_med"],         b.get("rt_med"))
     mf1_s = _f(tech["macro_f1"])   if tech else "—"
     map_s = _f(tech["macro_ap"])   if tech else "—"
     return (f"| {num} | `{name}` | {arch_cell} | {ka} | {note_cell} | "
-            f"{vad_s} | {rpa_s} | {vdr_s} | {med_s} | {mf1_s} | {map_s} |")
+            f"{vad_s} | {rpa_s} | {vdr_s} | {vf1_s} | {vfa_s} | {med_s} | {mf1_s} | {map_s} |")
 
 
 def make_leaderboard_row(num, name, arch_cell, overall, tech, primary):
-    vad_s = f"{overall['vad_acc']*100:.1f}"
-    rpa_s = f"{overall['rt_rpa']*100:.1f}"
-    vdr_s = f"{overall['rt_vdr']*100:.1f}"
-    med_s = f"{overall['rt_med']:.1f}"
+    vad_s = _pct(overall.get("vad_acc"))
+    rpa_s = _pct(overall.get("rt_rpa"))
+    vdr_s = _pct(overall.get("rt_vdr"))
+    vf1_s = _pct(overall.get("rt_vf1"))
+    vfa_s = _pct(overall.get("rt_vfa"))
+    med_s = f"{overall['rt_med']:.1f}" if not math.isnan(overall.get("rt_med", float('nan'))) else "—"
     mf1_s = _f(tech["macro_f1"])  if tech else "—"
     map_s = _f(tech["macro_ap"])  if tech else "—"
     pri_s = f"{primary:.4f}"
     return (f"| {num} | `{name}` | {arch_cell} | "
-            f"{vad_s} | {rpa_s} | {vdr_s} | {med_s} | "
+            f"{vad_s} | {rpa_s} | {vdr_s} | {vf1_s} | {vfa_s} | {med_s} | "
             f"{mf1_s} | {map_s} | {pri_s} |")
 
 
@@ -537,8 +547,8 @@ def _rebuild_leaderboard(path):
         if not m:
             continue
         cells = [c.strip() for c in row.strip().strip("|").split("|")]
-        # cells: [num, name, arch, key_args, note, vad, rpa, vdr, med, mf1, map]
-        #  idx:    0     1     2      3         4    5    6    7    8    9    10
+        # cells: [num, name, arch, key_args, note, vad, rpa, vdr, vf1, vfa, med, mf1, map]
+        #  idx:    0     1     2      3         4    5    6    7    8    9    10   11   12
         if len(cells) < 11:
             continue
         name     = m.group(1)
@@ -546,19 +556,28 @@ def _rebuild_leaderboard(path):
         vad_num  = _parse_num(cells[5])
         rpa_num  = _parse_num(cells[6])
         vdr_num  = _parse_num(cells[7])
-        med_num  = _parse_num(cells[8])
-        mf1_num  = _parse_num(cells[9])
-        map_num  = _parse_num(cells[10])
+        n = len(cells)
+        # Support old rows (11 cols: no vf1/vfa), new+vf1 (12 cols), new+vf1+vfa (13 cols)
+        vf1_num  = _parse_num(cells[8])  if n > 11 else None
+        vfa_num  = _parse_num(cells[9])  if n > 12 else None
+        med_idx  = 10 if n > 12 else (9 if n > 11 else 8)
+        mf1_idx  = med_idx + 1
+        map_idx  = med_idx + 2
+        med_num  = _parse_num(cells[med_idx]) if n > med_idx else None
+        mf1_num  = _parse_num(cells[mf1_idx]) if n > mf1_idx else None
+        map_num  = _parse_num(cells[map_idx]) if n > map_idx else None
         primary  = mf1_num if mf1_num is not None else (rpa_num or 0.0)
         vad_s = f"{vad_num:.1f}" if vad_num is not None else "—"
         rpa_s = f"{rpa_num:.1f}" if rpa_num is not None else "—"
         vdr_s = f"{vdr_num:.1f}" if vdr_num is not None else "—"
+        vf1_s = f"{vf1_num:.1f}" if vf1_num is not None else "—"
+        vfa_s = f"{vfa_num:.1f}" if vfa_num is not None else "—"
         med_s = f"{med_num:.1f}" if med_num is not None else "—"
-        mf1_s = cells[9]
-        map_s = cells[10]
+        mf1_s = cells[mf1_idx] if n > mf1_idx else "—"
+        map_s = cells[map_idx] if n > map_idx else "—"
         pri_s = f"{primary:.4f}"
         lb_row = (f"| _ | `{name}` | {arch} | "
-                  f"{vad_s} | {rpa_s} | {vdr_s} | {med_s} | "
+                  f"{vad_s} | {rpa_s} | {vdr_s} | {vf1_s} | {vfa_s} | {med_s} | "
                   f"{mf1_s} | {map_s} | {pri_s} |")
         lb_rows.append((primary, lb_row, name))
 
@@ -686,10 +705,11 @@ def main():
                       voicing_threshold=args.voicing_threshold,
                       onset_penalty=args.onset_penalty)
 
-    # GTSinger technique eval (cross-dataset generalisation)
+    # GTSinger technique eval (cross-dataset generalisation).
+    # data_dir=None skips redundant pitch eval — pitch results already captured above.
     ev_gt = {}
     if gt_tech_dir_abs:
-        ev_gt = run_evaluate(ckpt_path, data_dir_abs, gt_tech_dir_abs,
+        ev_gt = run_evaluate(ckpt_path, None, gt_tech_dir_abs,
                              label="GTSinger technique eval",
                              voicing_threshold=args.voicing_threshold,
                              onset_penalty=args.onset_penalty)

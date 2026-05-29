@@ -65,8 +65,10 @@ def parse_args():
     p = argparse.ArgumentParser(description="VocalCoach evaluation harness")
     p.add_argument("--checkpoint", required=True,
                    help="path to VocalCoach checkpoint (.pth)")
-    p.add_argument("--data-dir", default="../data",
-                   help="directory with test.npz (default: ../data)")
+    p.add_argument("--data-dir", default=None,
+                   help="directory with test.npz. Omit to skip pitch/VAD eval.")
+    p.add_argument("--skip-pitch", action="store_true",
+                   help="skip pitch/VAD eval even if --data-dir is set")
     p.add_argument("--technique-dir", default=None,
                    help="directory with technique_test.npz "
                         "(default: None — skip technique evaluation)")
@@ -115,8 +117,26 @@ def pitch_metrics(f0_dec, f0_ref, vad_pred=None):
     else:
         vad_acc = float(np.mean(voiced_pred == voiced_gt))
 
-    # Voicing Detection Rate
+    # Voicing Detection Rate (recall on voiced frames)
     vdr = float(np.mean(voiced_pred[voiced_gt])) if voiced_gt.sum() > 0 else float('nan')
+
+    # Voicing F1 and False Alarm Rate — from raw TP/FP/FN counts.
+    # VFA (Voicing False Alarm) = FP / total_silence_frames: how often a silence
+    # frame is wrongly called voiced. Directly exposes dead/saturated VAD heads
+    # that vF1 and VAD Acc both partially hide (vF1 trades off recall vs precision,
+    # VAD Acc is dominated by the majority class).
+    tp = int((voiced_pred & voiced_gt).sum())
+    fp = int((voiced_pred & ~voiced_gt).sum())
+    fn = int((~voiced_pred & voiced_gt).sum())
+    tn = int((~voiced_pred & ~voiced_gt).sum())
+    prec_v = tp / (tp + fp) if (tp + fp) > 0 else float('nan')
+    rec_v  = tp / (tp + fn) if (tp + fn) > 0 else float('nan')
+    if not (np.isnan(prec_v) or np.isnan(rec_v)) and (prec_v + rec_v) > 0:
+        vf1 = float(2 * prec_v * rec_v / (prec_v + rec_v))
+    else:
+        vf1 = float('nan')
+    # VFA: low = good (model respects silence); target < 15% for a usable backbone
+    vfa = float(fp / (fp + tn)) if (fp + tn) > 0 else float('nan')
 
     # Pitch metrics on doubly-voiced frames
     both = voiced_gt & voiced_pred
@@ -133,7 +153,7 @@ def pitch_metrics(f0_dec, f0_ref, vad_pred=None):
     else:
         rpa = gross = rca = med_c = float('nan')
 
-    return dict(vad_acc=vad_acc, vdr=vdr, rpa=rpa, rca=rca,
+    return dict(vad_acc=vad_acc, vdr=vdr, vf1=vf1, vfa=vfa, rpa=rpa, rca=rca,
                 gross=gross, median_cents=med_c)
 
 
@@ -160,7 +180,7 @@ def eval_pitch(model, data_dir, device, label="VocalCoach", voicing_threshold=0.
     clip_results = []
     for i in tqdm(range(N), desc=f"  Evaluating {label}", leave=False):
         mel = torch.from_numpy(clips[i]).unsqueeze(0).to(device)
-        v, p, _, _ = model(mel)
+        v, p, _, _, _, _ = model(mel)
         pv = v.squeeze().cpu().numpy()    # (T,)
         pp = p.squeeze(0).cpu().numpy()   # (T, 360)
         T  = pv.shape[0]
@@ -185,33 +205,36 @@ def eval_pitch(model, data_dir, device, label="VocalCoach", voicing_threshold=0.
         c   = by_snr[snr]
         tag = "clean" if not np.isfinite(snr) else f"{snr:+.0f} dB"
         results[tag] = {k: smean(c, k) for k in
-                        ['vad_acc', 'vdr', 'rpa', 'rca', 'gross', 'median_cents']}
+                        ['vad_acc', 'vdr', 'vf1', 'vfa', 'rpa', 'rca', 'gross', 'median_cents']}
 
     macro_rpa = float(np.nanmean([v['rpa'] for v in results.values()]))
+    macro_vf1 = float(np.nanmean([v['vf1'] for v in results.values()]))
     results['_macro_rpa'] = macro_rpa
+    results['_macro_vf1'] = macro_vf1
     return results
 
 
 def print_pitch_table(results, label="Model"):
-    print(f"\n{'═'*74}")
+    print(f"\n{'═'*94}")
     print(f"  {label} — Pitch & VAD Evaluation")
-    print(f"{'═'*74}")
-    hdr = f"  {'Condition':<10}  {'VAD Acc':>8}  {'VDR':>8}  "
+    print(f"{'═'*94}")
+    hdr = f"  {'Condition':<10}  {'VAD Acc':>8}  {'VDR':>8}  {'VFA↓':>8}  {'vF1':>8}  "
     hdr += f"{'RPA':>8}  {'RCA':>8}  {'Gross':>8}  {'Med.c':>7}"
     print(hdr)
-    print(f"  {'─'*10}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*7}")
+    print(f"  {'─'*10}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*7}")
     for tag, m in results.items():
         if tag.startswith('_'):
             continue
         def fmt(v, pct=True):
             if np.isnan(v): return '     n/a'
             return f"{v:8.1%}" if pct else f"{v:7.1f}"
-        row = (f"  {tag:<10}  {fmt(m['vad_acc'])}  {fmt(m['vdr'])}"
+        row = (f"  {tag:<10}  {fmt(m['vad_acc'])}  {fmt(m['vdr'])}  {fmt(m.get('vfa', float('nan')))}  {fmt(m['vf1'])}"
                f"  {fmt(m['rpa'])}  {fmt(m['rca'])}"
                f"  {fmt(m['gross'])}  {fmt(m['median_cents'], pct=False)}")
         print(row)
-    macro = results.get('_macro_rpa', float('nan'))
-    print(f"\n  Macro RPA: {macro:.4f}")
+    macro_rpa = results.get('_macro_rpa', float('nan'))
+    macro_vf1 = results.get('_macro_vf1', float('nan'))
+    print(f"\n  Macro RPA: {macro_rpa:.1%}  |  Macro vF1: {macro_vf1:.1%}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -251,7 +274,7 @@ def eval_technique(model, technique_dir, device):
             continue
 
         mel_t = torch.from_numpy(mel_clip).unsqueeze(0).to(device)
-        _, _, pred_tech, _ = model(mel_t)
+        _, _, pred_tech, _, _, _ = model(mel_t)
         # Average over time to get clip-level prediction
         pred_clip = pred_tech.squeeze(0).mean(0).cpu().numpy()   # (N_TECH,)
         all_pred.append(pred_clip)
@@ -415,8 +438,9 @@ def eval_nanopitch(ckpt_path, data_dir, device):
         c   = by_snr[snr]
         tag = "clean" if not np.isfinite(snr) else f"{snr:+.0f} dB"
         results[tag] = {k: smean(c, k) for k in
-                        ['vad_acc', 'vdr', 'rpa', 'rca', 'gross', 'median_cents']}
+                        ['vad_acc', 'vdr', 'vf1', 'vfa', 'rpa', 'rca', 'gross', 'median_cents']}
     results['_macro_rpa'] = float(np.nanmean([v['rpa'] for v in results.values()]))
+    results['_macro_vf1'] = float(np.nanmean([v['vf1'] for v in results.values()]))
     return results
 
 
@@ -451,18 +475,19 @@ def main():
     label = f"VocalCoach{arch.upper()} (causal={causal}, epoch={ckpt.get('epoch','?')})"
     print(f"Loaded: {label}")
 
-    data_dir     = os.path.abspath(args.data_dir)
+    data_dir     = os.path.abspath(args.data_dir) if args.data_dir else None
     tech_dir     = os.path.abspath(args.technique_dir) if args.technique_dir else None
 
     all_results = {}
 
     # ── Pitch / VAD ──────────────────────────────────────────────────
-    pitch_res = eval_pitch(model, data_dir, device, label=label,
-                           voicing_threshold=args.voicing_threshold,
-                           onset_penalty=args.onset_penalty)
-    if pitch_res:
-        print_pitch_table(pitch_res, label=label)
-        all_results['pitch'] = pitch_res
+    if data_dir and not getattr(args, 'skip_pitch', False):
+        pitch_res = eval_pitch(model, data_dir, device, label=label,
+                               voicing_threshold=args.voicing_threshold,
+                               onset_penalty=args.onset_penalty)
+        if pitch_res:
+            print_pitch_table(pitch_res, label=label)
+            all_results['pitch'] = pitch_res
 
     # ── NanoPitch baseline ───────────────────────────────────────────
     if args.nanopitch:
@@ -496,7 +521,7 @@ def main():
     if args.csv and 'pitch' in all_results:
         import csv
         with open(args.csv, 'w', newline='') as f:
-            fields = ['condition', 'vad_acc', 'vdr', 'rpa', 'rca', 'gross', 'median_cents']
+            fields = ['condition', 'vad_acc', 'vdr', 'vf1', 'vfa', 'rpa', 'rca', 'gross', 'median_cents']
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             for tag, m in all_results['pitch'].items():
