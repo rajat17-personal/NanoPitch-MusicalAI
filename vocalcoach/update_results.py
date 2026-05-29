@@ -232,7 +232,7 @@ def diff_args(args, data_dir=None, technique_dirs=None):
 
 # ── Run evaluate.py, return parsed JSON ───────────────────────────────────────
 
-def run_evaluate(ckpt_path, data_dir, technique_dir, label="", voicing_threshold=0.3, onset_penalty=2.0):
+def run_evaluate(ckpt_path, data_dir, technique_dir, label="", voicing_threshold=0.3, onset_penalty=1.0):
     script = os.path.join(os.path.dirname(__file__), "evaluate.py")
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         json_path = tmp.name
@@ -638,9 +638,9 @@ def main():
     p.add_argument("--results-md",    default=None)
     p.add_argument("--voicing-threshold", type=float, default=0.3,
                    help="Viterbi frame-0 init threshold (minor effect — see --onset-penalty).")
-    p.add_argument("--onset-penalty", type=float, default=2.0,
-                   help="Viterbi voiced<->unvoiced transition cost. Default 2.0 suits pitch-only "
-                        "models. Multi-task models need lower (0.5-1.0) to recover VDR because "
+    p.add_argument("--onset-penalty", type=float, default=1.0,
+                   help="Viterbi voiced<->unvoiced transition cost. Default 1.0 suits multi-task "
+                        "models with diffuse posteriors. Pitch-only models with sharper posteriors "
                         "diffuse pitch posteriors make the unvoiced state more competitive.")
     p.add_argument("--print-only",    action="store_true")
     p.add_argument("--delete",        default=None, metavar="NAME")

@@ -203,7 +203,7 @@ def f0_to_posteriorgram(f0_hz, n_frames=None, sigma_bins=1.2):
 
 
 def viterbi_decode(posteriorgram, transition_width=12, voicing_threshold=0.3,
-                   onset_penalty=2.0):
+                   onset_penalty=1.0):
     """Offline Viterbi decoder: posteriorgram → smooth f0 track.
 
     Finds the globally optimal pitch sequence using dynamic programming.

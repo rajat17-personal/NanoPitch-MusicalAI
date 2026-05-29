@@ -82,11 +82,10 @@ def parse_args():
                    help="Viterbi init threshold: min pitch posterior peak at frame 0 to start "
                         "as voiced. Has minimal effect beyond the first frame — tune "
                         "--onset-penalty instead for VDR control.")
-    p.add_argument("--onset-penalty", type=float, default=2.0,
+    p.add_argument("--onset-penalty", type=float, default=1.0,
                    help="Viterbi voiced<->unvoiced transition cost (log-domain). "
-                        "Default 2.0 suits pitch-only models with sharp posteriors. "
-                        "Multi-task models have diffuse posteriors (peaks 0.15-0.25), making "
-                        "the unvoiced state more competitive — lower to 0.5-1.0 to recover VDR. "
+                        "Default 1.0 suits multi-task models with diffuse posteriors (peaks "
+                        "0.15-0.25). Pitch-only models with sharper posteriors may prefer 2.0. "
                         "Grid-search VDR vs FAR tradeoff: lower = more voiced frames decoded.")
     return p.parse_args()
 
@@ -143,7 +142,7 @@ def pitch_metrics(f0_dec, f0_ref, vad_pred=None):
 # ═══════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def eval_pitch(model, data_dir, device, label="VocalCoach", voicing_threshold=0.3, onset_penalty=2.0):
+def eval_pitch(model, data_dir, device, label="VocalCoach", voicing_threshold=0.3, onset_penalty=1.0):
     """Evaluate pitch accuracy and VAD on test.npz across SNR conditions."""
     test_path = os.path.join(data_dir, "test.npz")
     if not os.path.exists(test_path):
