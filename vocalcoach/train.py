@@ -407,12 +407,27 @@ class PitchVADDataset(Dataset):
 
     def __init__(self, data_dir, seq_len=300):
         self.seq_len = seq_len
-        clean = np.load(os.path.join(data_dir, "clean.npz"))
-        # Keep float16 in RAM — 2× smaller than float32. Cast on slice in __getitem__.
-        self.mel = clean["mel"]                          # (total_frames, 40) float16
-        self.f0  = clean["f0"]                          # (total_frames,)    float16
-        self.vad = clean["vad"]                         # (total_frames,)    float16
-        lengths  = clean["lengths"]
+        # Prefer separate clean_mel.npy / clean_f0.npy / clean_vad.npy files when
+        # present — np.memmap works on plain .npy but not on arrays inside a zip
+        # (NPZ). For large datasets (>~6GB) the NPZ path loads everything into RAM
+        # and triggers OOM; the .npy path pages in only the accessed regions.
+        # Generate with: python3 -c "
+        #   import numpy as np, os
+        #   d = np.load('path/to/clean.npz')
+        #   for k in ['mel','f0','vad','lengths']:
+        #       np.save(f'path/to/clean_{k}.npy', d[k])"
+        mel_npy = os.path.join(data_dir, "clean_mel.npy")
+        if os.path.exists(mel_npy):
+            self.mel = np.load(mel_npy, mmap_mode='r')
+            self.f0  = np.load(os.path.join(data_dir, "clean_f0.npy"),      mmap_mode='r')
+            self.vad = np.load(os.path.join(data_dir, "clean_vad.npy"),     mmap_mode='r')
+            lengths  = np.load(os.path.join(data_dir, "clean_lengths.npy"), mmap_mode='r')
+        else:
+            clean    = np.load(os.path.join(data_dir, "clean.npz"))
+            self.mel = clean["mel"]
+            self.f0  = clean["f0"]
+            self.vad = clean["vad"]
+            lengths  = clean["lengths"]
 
         self.segments = []
         offset = 0
@@ -823,15 +838,34 @@ def make_joint_loader(pitch_vad_dir, technique_dirs, seq_len, batch_size,
               ", ".join(f"{sz} clips → {1/len(datasets):.1%}/epoch"
                         for sz in dataset_sizes))
 
+    # Cap workers to 1 when using mmap-backed datasets: each worker opens its
+    # own virtual mapping of the file. On WSL2, the overcommit heuristic counts
+    # virtual mmap size per worker even when no pages are physically resident,
+    # causing OOM kills with large datasets (>~8GB). 1 worker avoids this while
+    # still overlapping data loading with GPU compute.
+    effective_workers = num_workers
+    if hasattr(dataset, 'datasets'):
+        # ConcatDataset — check any child
+        child_datasets = dataset.datasets
+    else:
+        child_datasets = [dataset]
+    for ds in child_datasets:
+        if hasattr(ds, 'mel') and isinstance(ds.mel, np.memmap):
+            if num_workers > 1:
+                effective_workers = 1
+                print(f"  [info] mmap dataset detected — capping num_workers "
+                      f"{num_workers}→1 to avoid WSL2 overcommit OOM")
+            break
+
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=(sampler is None),
         sampler=sampler,
         drop_last=True,
-        num_workers=num_workers,
+        num_workers=effective_workers,
         pin_memory=True,
-        persistent_workers=(num_workers > 0),
+        persistent_workers=(effective_workers > 0),
     )
     return loader
 
@@ -1729,12 +1763,26 @@ def main():
     if resume_ckpt:
         _param_groups_changed = args.probe_mode or (args.lr_backbone is not None)
         if "optimizer" in resume_ckpt and not _param_groups_changed:
-            optimizer.load_state_dict(resume_ckpt["optimizer"])
+            saved_groups  = resume_ckpt["optimizer"].get("param_groups", [])
+            current_groups = optimizer.param_groups
+            if len(saved_groups) == len(current_groups) and all(
+                len(sg["params"]) == len(cg["params"])
+                for sg, cg in zip(saved_groups, current_groups)
+            ):
+                optimizer.load_state_dict(resume_ckpt["optimizer"])
+            else:
+                print(f"  Skipping optimizer state: param group size mismatch "
+                      f"(checkpoint has {[len(g['params']) for g in saved_groups]} params, "
+                      f"model has {[len(g['params']) for g in current_groups]}) — "
+                      f"architecture changed, starting with fresh optimizer.")
         elif "optimizer" in resume_ckpt and _param_groups_changed:
             reason = "probe mode" if args.probe_mode else "differential LR (param groups changed)"
             print(f"  Skipping optimizer state: {reason}")
         if "scheduler" in resume_ckpt and not _param_groups_changed:
-            scheduler.load_state_dict(resume_ckpt["scheduler"])
+            try:
+                scheduler.load_state_dict(resume_ckpt["scheduler"])
+            except Exception as e:
+                print(f"  Skipping scheduler state: {e}")
         del resume_ckpt
 
     writer = SummaryWriter(log_dir=os.path.join(output_dir, "tb"))
@@ -1849,7 +1897,9 @@ def main():
                 eval_res = evaluate(model, eval_dir, tech_dirs,
                                     writer, epoch, device, args)
                 if 'macro_f1' in eval_res:
-                    vf1_clean = eval_res.get('vf1_clean', 1.0)
+                    # Default 0.0: missing vf1_clean means VAD head is dead (no
+                    # voiced predictions at all) — should not get a free 1.0 score.
+                    vf1_clean = eval_res.get('vf1_clean', 0.0)
                     w = args.metric_vdr_weight
                     metric = eval_res['macro_f1'] + w * vf1_clean
                     metric_name = f"f1+{w}*vf1"
@@ -1859,10 +1909,20 @@ def main():
                     # recall, preventing dead/saturated VAD heads from gaming the
                     # metric (high VDR alone could be achieved by predicting all
                     # frames as voiced; vF1 penalizes the resulting false alarms).
-                    vf1_clean = eval_res.get('vf1_clean', 1.0)
+                    # Default 0.0: missing vf1_clean means VAD head predicted no
+                    # voiced frames — treat as worst-case, not perfect.
+                    # Use macro_vf1 (average across all SNR conditions) rather than
+                    # vf1_clean (clean condition only). macro_vf1 is more stable —
+                    # vf1_clean is a single partition with higher epoch-to-epoch
+                    # variance and can regress on clean while improving on noisy
+                    # conditions, causing valid checkpoints to be missed.
+                    macro_vf1 = eval_res.get('macro_vf1', 0.0)
+                    macro_rpa = eval_res.get('macro_rpa', 0.0)
+                    if np.isnan(macro_vf1): macro_vf1 = 0.0
+                    if np.isnan(macro_rpa): macro_rpa = 0.0
                     w = args.metric_vdr_weight
-                    metric = eval_res['macro_rpa'] + w * vf1_clean
-                    metric_name = f"rpa+{w}*vf1"
+                    metric = macro_rpa + w * macro_vf1
+                    metric_name = f"rpa+{w}*macro_vf1"
                 else:
                     metric = float('nan')
                     metric_name = "none"
@@ -1895,4 +1955,11 @@ def main():
 
 
 if __name__ == "__main__":
+    # Use 'spawn' instead of 'fork' for DataLoader workers so they do not
+    # inherit the parent's full virtual address space. With large mmap datasets
+    # (e.g. merged_pitchvad_reverb at ~11GB virtual), forked workers cause WSL2
+    # to exceed its overcommit limit and OOM-kill the process even though the
+    # mmap pages are not physically resident. Spawn starts workers fresh.
+    import torch.multiprocessing as mp
+    mp.set_start_method("spawn", force=True)
     main()

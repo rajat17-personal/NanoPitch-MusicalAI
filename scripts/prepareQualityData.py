@@ -358,6 +358,12 @@ def write_pairs(popbutfy_dir: str, baselines_json: str, output_path: str,
 
     pairs = build_pairs(popbutfy_dir, baselines)
     if max_clips:
+        # Shuffle before capping so the subset spans all singer×song keys.
+        # build_pairs() emits a sorted cartesian product, so pairs[:N] without
+        # shuffling would draw only from the first few singers. Fixed seed keeps
+        # the subset reproducible across regenerations.
+        rng = np.random.default_rng(0)
+        rng.shuffle(pairs)
         pairs = pairs[:max_clips]
     if not pairs:
         print("  [warn] No matched pairs found — skipping quality_pairs.npz")

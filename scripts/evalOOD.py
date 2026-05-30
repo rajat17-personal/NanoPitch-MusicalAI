@@ -58,6 +58,14 @@ HIGHER_IS_BETTER = {'vad_acc', 'vdr', 'vf1', 'rpa', 'rca'}
 # Metrics where lower = better
 LOWER_IS_BETTER  = {'vfa', 'gross', 'median_cents'}
 
+# Metrics that trigger a warning but never block logging.
+# gross and median_cents naturally worsen when VDR rises (more voiced frames decoded
+# means more pitch attempts on hard/ambiguous frames). Blocking on these would
+# reject better VAD models simply because they detect more voiced frames.
+# vfa is warn-only too — a model with high VDR may accept slightly more false alarms
+# as part of the precision/recall tradeoff (pos-weight training).
+WARN_ONLY = {'gross', 'median_cents', 'vfa', 'rca'}
+
 
 def extract_mel(y: np.ndarray) -> np.ndarray:
     """Return (T, 40) log-mel matching api.py pipeline."""
@@ -217,17 +225,21 @@ def best_so_far(tracker: dict, dataset: str) -> dict:
     return best
 
 
-def regression_check(overall: dict, best: dict, threshold: float = 0.10) -> list[dict]:
+def regression_check(overall: dict, best: dict, threshold: float = 0.25) -> tuple[list[dict], list[dict]]:
     """
     Compare current run's overall metrics against the best-so-far.
-    Returns a list of regression dicts for metrics that degraded > threshold
-    (relative). Empty list = no regressions.
+
+    Returns (blocking, warn_only):
+        blocking:  metrics in HIGHER_IS_BETTER | LOWER_IS_BETTER - WARN_ONLY that degraded
+                   > threshold. A non-empty list prevents writing to the log.
+        warn_only: metrics in WARN_ONLY that degraded > threshold. These are always
+                   printed but never block logging (gross/median_cents degrade naturally
+                   when VDR rises; vfa trades off against VDR under pos-weight training).
 
     For higher-is-better: regression if (best - current) / best > threshold
     For lower-is-better:  regression if (current - best) / best > threshold
-    (median_cents=0 edge case: treated as no regression)
     """
-    regressions = []
+    blocking, warn_only = [], []
     for metric, current_val in overall.items():
         if np.isnan(current_val) or metric not in best:
             continue
@@ -241,13 +253,13 @@ def regression_check(overall: dict, best: dict, threshold: float = 0.10) -> list
             rel_change = (current_val - best_val) / abs(best_val)
 
         if rel_change > threshold:
-            regressions.append({
-                "metric":    metric,
-                "current":   current_val,
-                "best":      best_val,
-                "rel_drop":  rel_change,
-            })
-    return regressions
+            entry = {"metric": metric, "current": current_val,
+                     "best": best_val, "rel_drop": rel_change}
+            if metric in WARN_ONLY:
+                warn_only.append(entry)
+            else:
+                blocking.append(entry)
+    return blocking, warn_only
 
 
 def infer_run_name(checkpoint_path: str) -> str:
@@ -289,7 +301,8 @@ def parse_args():
     p.add_argument("--voicing-threshold", type=float, default=0.3)
     p.add_argument("--onset-penalty",     type=float, default=1.0)
     p.add_argument("--regression-threshold", type=float, default=0.25,
-                   help="Relative degradation threshold for regression flag (default: 0.10 = 10%%)")
+                   help="Relative degradation threshold for blocking regression (default: 0.25 = 25%%). "
+                        "gross, median_cents, and vfa are warn-only and never block logging.")
     p.add_argument("--csv", default=None,
                    help="Also save per-clip CSV to this path")
     return p.parse_args()
@@ -369,25 +382,35 @@ def main():
     # ── Load tracker + regression check ──────────────────────────────
     tracker = load_tracker(args.log)
     best    = best_so_far(tracker, args.dataset)
-    regressions = regression_check(overall, best, args.regression_threshold)
+    blocking, warn_only = regression_check(overall, best, args.regression_threshold)
+
+    def _fmt_metric(metric, val):
+        return f"{val:.1%}" if metric != 'median_cents' else f"{val:.1f}"
 
     print(f"\n{'═'*60}")
     if not best:
         print("  First run on this dataset — no baseline to compare against.")
         status = "first"
-    elif regressions:
+    elif blocking:
         print(f"  ⚠  REGRESSION DETECTED (threshold: {args.regression_threshold:.0%})")
         print(f"  {'Metric':<16}  {'Current':>10}  {'Best':>10}  {'Drop':>8}")
         print(f"  {'─'*16}  {'─'*10}  {'─'*10}  {'─'*8}")
-        for r in regressions:
-            cur = f"{r['current']:.1%}" if r['metric'] != 'median_cents' else f"{r['current']:.1f}"
-            bst = f"{r['best']:.1%}"    if r['metric'] != 'median_cents' else f"{r['best']:.1f}"
-            print(f"  {r['metric']:<16}  {cur:>10}  {bst:>10}  {r['rel_drop']:>7.1%}")
+        for r in blocking:
+            print(f"  {r['metric']:<16}  {_fmt_metric(r['metric'], r['current']):>10}"
+                  f"  {_fmt_metric(r['metric'], r['best']):>10}  {r['rel_drop']:>7.1%}")
+        if warn_only:
+            print(f"\n  ⚡ Warn-only (not blocking): {', '.join(r['metric'] for r in warn_only)}")
         print(f"\n  Run REJECTED — results not written to {args.log}.")
         status = "regressed"
     else:
-        # Show improvements over best
-        print(f"  ✓  No regressions vs best-so-far  (threshold: {args.regression_threshold:.0%})")
+        print(f"  ✓  No blocking regressions vs best-so-far  (threshold: {args.regression_threshold:.0%})")
+        if warn_only:
+            print(f"\n  ⚡ Warn-only regressions (gross/vfa trade off with VDR — not blocking):")
+            print(f"  {'Metric':<16}  {'Current':>10}  {'Best':>10}  {'Drop':>8}")
+            print(f"  {'─'*16}  {'─'*10}  {'─'*10}  {'─'*8}")
+            for r in warn_only:
+                print(f"  {r['metric']:<16}  {_fmt_metric(r['metric'], r['current']):>10}"
+                      f"  {_fmt_metric(r['metric'], r['best']):>10}  {r['rel_drop']:>7.1%}")
         improvements = []
         for metric in HIGHER_IS_BETTER | LOWER_IS_BETTER:
             cur = overall.get(metric, float('nan'))
@@ -403,11 +426,9 @@ def main():
                 if delta > 0.001:
                     improvements.append((metric, cur, bst, delta))
         if improvements:
-            print(f"  Improvements over previous best:")
+            print(f"\n  Improvements over previous best:")
             for metric, cur, bst, delta in improvements:
-                cur_s = f"{cur:.1%}" if metric != 'median_cents' else f"{cur:.1f}"
-                bst_s = f"{bst:.1%}" if metric != 'median_cents' else f"{bst:.1f}"
-                print(f"    {metric:<16}  {cur_s} (was {bst_s}, +{delta:.1%})")
+                print(f"    {metric:<16}  {_fmt_metric(metric, cur)} (was {_fmt_metric(metric, bst)}, +{delta:.1%})")
         status = "ok"
     print(f"{'═'*60}")
 

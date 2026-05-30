@@ -361,18 +361,18 @@ class VocalCoachTCN(nn.Module):
             for i in range(n_blocks)
         ])
 
-        # Optional self-attention layers after the TCN stack. Each layer is a
-        # standard pre-norm MultiheadAttention + residual. This gives the TCN
-        # global context for VAD decisions without replacing the local conv
-        # backbone. n_attn_layers=0 (default) preserves the original TCN.
-        self.attn_layers = nn.ModuleList()
-        for _ in range(n_attn_layers):
-            self.attn_layers.append(nn.ModuleDict({
-                'norm': nn.LayerNorm(hidden),
-                'attn': nn.MultiheadAttention(hidden, n_heads,
-                                              dropout=dropout, batch_first=True),
-                'drop': nn.Dropout(dropout),
-            }))
+        # Optional Conformer blocks after the TCN stack.
+        # Using full ConformerBlock (FF → Attn → Conv → FF → Norm) rather than
+        # a bare MHA+residual because the FF modules buffer attention gradients,
+        # preventing the global attention signal from overwriting the local VAD
+        # features built by the TCN conv stack. A bare MHA layer lets the pitch
+        # loss (dominant under tight sigma or high w-pitch) flow directly into
+        # the shared representation and suppresses the VAD head gradient.
+        # n_attn_layers=0 (default) preserves the original pure-TCN behaviour.
+        self.attn_layers = nn.ModuleList([
+            ConformerBlock(hidden, n_heads=n_heads, dropout=dropout, causal=causal)
+            for _ in range(n_attn_layers)
+        ])
 
         self.norm = nn.LayerNorm(hidden)
 
@@ -451,16 +451,7 @@ class VocalCoachTCN(nn.Module):
             x = block(x)
 
         for layer in self.attn_layers:
-            h = layer['norm'](x)
-            if self.causal:
-                T = x.size(1)
-                mask = torch.triu(
-                    torch.ones(T, T, device=x.device, dtype=torch.bool),
-                    diagonal=1)
-            else:
-                mask = None
-            h, _ = layer['attn'](h, h, h, attn_mask=mask)
-            x = x + layer['drop'](h)
+            x = layer(x)
 
         x = self.norm(x)
 
