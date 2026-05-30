@@ -529,11 +529,17 @@ class TechniqueDataset(Dataset):
 class NoteDataset(Dataset):
     """Loads note_train.npz for note onset/offset frame-level supervision (Variant 4).
 
-    NPZ schema (flat layout, produced by extractNotes.py or similar):
-      mel:     (total_frames, 40)   float16
-      onset:   (total_frames,)      float32  — 1.0 at note onset frames
-      offset:  (total_frames,)      float32  — 1.0 at note offset frames
-      lengths: (n_clips,)           int32
+    NPZ schema — two supported layouts:
+      Dense (preferred):
+        mel:     (total_frames, 40)   float16
+        onset:   (total_frames,)      float32  — 1.0 at note onset frames
+        offset:  (total_frames,)      float32  — 1.0 at note offset frames
+        lengths: (n_clips,)           int32
+      Sparse (extractAnnotatedVocalSet.py output):
+        mel, lengths as above
+        note_onsets:  (n_notes,) int32 — absolute frame indices of note starts
+        note_offsets: (n_notes,) int32 — absolute frame indices of note ends
+        (note_midi, note_clip, n_notes also present but unused here)
 
     Returns (onset_target, offset_target, has_note) per sample where
     has_note=1.0 signals that this sample has real labels.
@@ -545,9 +551,26 @@ class NoteDataset(Dataset):
         data = np.load(path, allow_pickle=False)
 
         self.mel    = data["mel"]                          # (total_frames, 40) float16
-        self.onset  = data["onset"].astype(np.float32)    # (total_frames,)
-        self.offset = data["offset"].astype(np.float32)   # (total_frames,)
         lengths     = data["lengths"]
+        total_frames = int(self.mel.shape[0])
+
+        if "onset" in data and "offset" in data:
+            # Dense format: flat binary arrays already built
+            self.onset  = data["onset"].astype(np.float32)
+            self.offset = data["offset"].astype(np.float32)
+        else:
+            # Sparse format from extractAnnotatedVocalSet.py:
+            #   note_onsets/note_offsets are absolute frame indices (not clip-relative)
+            self.onset  = np.zeros(total_frames, dtype=np.float32)
+            self.offset = np.zeros(total_frames, dtype=np.float32)
+            if "note_onsets" in data:
+                idx = data["note_onsets"].astype(np.int64)
+                idx = idx[(idx >= 0) & (idx < total_frames)]
+                self.onset[idx] = 1.0
+            if "note_offsets" in data:
+                idx = data["note_offsets"].astype(np.int64)
+                idx = idx[(idx >= 0) & (idx < total_frames)]
+                self.offset[idx] = 1.0
 
         self.segments = []
         offset_idx = 0
