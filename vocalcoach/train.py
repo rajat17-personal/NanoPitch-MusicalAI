@@ -181,6 +181,12 @@ parser.add_argument("--note-head", action="store_true", default=False,
                          "and head_note_offset — two binary frame-level classifiers. "
                          "Requires --note-dirs pointing to dirs with note_train.npz. "
                          "Default off — no change to existing runs.")
+parser.add_argument("--deep-note-head", action="store_true", default=False,
+                    help="replace flat Linear(h→1) note heads with "
+                         "Linear(h→h/4)→GELU→Dropout→Linear(h/4→1). Only active when "
+                         "--note-head is also set. Keeps the backbone gradient smaller "
+                         "than a flat head, which reduces VAD catastrophic forgetting "
+                         "in joint training — same motivation as --deep-technique-head.")
 parser.add_argument("--note-dirs", type=str, nargs="*", default=None,
                     help="directories containing note_train.npz for note onset/offset "
                          "supervision. If None while --note-head is set, note head "
@@ -1663,6 +1669,7 @@ def main():
     if args.deep_technique_head:  model_kwargs['deep_technique_head'] = True
     if quality_head_dim:          model_kwargs['quality_head'] = quality_head_dim
     if args.note_head:            model_kwargs['note_head'] = True
+    if args.note_head and args.deep_note_head: model_kwargs['deep_note_head'] = True
     model = build_model(args.arch, **model_kwargs)
 
     start_epoch = 1
@@ -1777,7 +1784,7 @@ def main():
         warmup_iters = len(ref_loader)
         warmup  = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_iters)
         cosine  = CosineAnnealingLR(optimizer,
-                                    T_max=total_iters - warmup_iters,
+                                    T_max=max(1, total_iters - warmup_iters),
                                     eta_min=args.lr * 0.01)
         scheduler = SequentialLR(optimizer, [warmup, cosine],
                                  milestones=[warmup_iters])

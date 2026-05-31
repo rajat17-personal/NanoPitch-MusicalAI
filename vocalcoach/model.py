@@ -343,7 +343,7 @@ class VocalCoachTCN(nn.Module):
     def __init__(self, n_mels=N_MELS, hidden=128, n_blocks=8, kernel_size=3,
                  causal=True, dropout=0.1, n_techniques=N_TECHNIQUES,
                  quality_head=0, deep_technique_head=False, note_head=False,
-                 n_attn_layers=0, n_heads=4):
+                 deep_note_head=False, n_attn_layers=0, n_heads=4):
         super().__init__()
         self.causal  = causal
         self.hidden  = hidden
@@ -411,15 +411,25 @@ class VocalCoachTCN(nn.Module):
         # note_offset: 1 at frames where a note ends
         self.has_note_head = note_head
         if note_head:
-            self.head_note_onset  = nn.Linear(hidden, 1)
-            self.head_note_offset = nn.Linear(hidden, 1)
+            if deep_note_head:
+                self.head_note_onset  = nn.Sequential(
+                    nn.Linear(hidden, hidden // 4), nn.GELU(),
+                    nn.Dropout(dropout), nn.Linear(hidden // 4, 1))
+                self.head_note_offset = nn.Sequential(
+                    nn.Linear(hidden, hidden // 4), nn.GELU(),
+                    nn.Dropout(dropout), nn.Linear(hidden // 4, 1))
+            else:
+                self.head_note_onset  = nn.Linear(hidden, 1)
+                self.head_note_offset = nn.Linear(hidden, 1)
 
         self._init_weights()
         n = sum(p.numel() for p in self.parameters())
         attn_str = f", attn={n_attn_layers}×{n_heads}h" if n_attn_layers else ""
+        note_str = (", deep_note_head=True" if (note_head and deep_note_head)
+                    else ", note_head=True" if note_head else "")
         print(f"VocalCoachTCN: {n:,} parameters "
               f"(hidden={hidden}, blocks={n_blocks}, causal={causal}{attn_str}"
-              f"{', note_head=True' if note_head else ''}"
+              f"{note_str}"
               f"{f', quality_head={quality_head}' if quality_head else ''})")
 
     def _init_weights(self):
@@ -640,7 +650,7 @@ class VocalCoachConformer(nn.Module):
     def __init__(self, n_mels=N_MELS, hidden=64, n_layers=4, n_heads=4,
                  ff_expansion=4, conv_kernel=31, dropout=0.1,
                  causal=False, n_techniques=N_TECHNIQUES, quality_head=0,
-                 deep_technique_head=False, note_head=False):
+                 deep_technique_head=False, note_head=False, deep_note_head=False):
         super().__init__()
         assert hidden % n_heads == 0, (
             f"hidden ({hidden}) must be divisible by n_heads ({n_heads})")
@@ -684,13 +694,23 @@ class VocalCoachConformer(nn.Module):
         # ── Optional note segmentation head (Variant 4) ──
         self.has_note_head = note_head
         if note_head:
-            self.head_note_onset  = nn.Linear(hidden, 1)
-            self.head_note_offset = nn.Linear(hidden, 1)
+            if deep_note_head:
+                self.head_note_onset  = nn.Sequential(
+                    nn.Linear(hidden, hidden // 4), nn.GELU(),
+                    nn.Dropout(dropout), nn.Linear(hidden // 4, 1))
+                self.head_note_offset = nn.Sequential(
+                    nn.Linear(hidden, hidden // 4), nn.GELU(),
+                    nn.Dropout(dropout), nn.Linear(hidden // 4, 1))
+            else:
+                self.head_note_onset  = nn.Linear(hidden, 1)
+                self.head_note_offset = nn.Linear(hidden, 1)
 
         n = sum(p.numel() for p in self.parameters())
+        note_str = (", deep_note_head=True" if (note_head and deep_note_head)
+                    else ", note_head=True" if note_head else "")
         print(f"VocalCoachConformer: {n:,} parameters "
               f"(hidden={hidden}, layers={n_layers}, heads={n_heads}, "
-              f"causal={causal}{', note_head=True' if note_head else ''}"
+              f"causal={causal}{note_str}"
               f"{f', quality_head={quality_head}' if quality_head else ''})")
 
     def forward(self, mel, return_embeddings=False):
