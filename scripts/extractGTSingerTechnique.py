@@ -201,6 +201,17 @@ def parse_args():
     p.add_argument("--max-per-technique", type=int, default=None,
                    help="max clips per technique per split (None = all)")
     p.add_argument("--min-duration", type=float, default=0.5)
+    p.add_argument("--pitch-shift-semitones", type=float, nargs="*", default=[],
+                   help="augment the TRAIN split with pitch-shifted copies (semitones, "
+                        "e.g. -2 2). Labels re-derived from shifted audio (exact). Test "
+                        "split is NEVER augmented. Use --pitch-backend gpu for speed.")
+    p.add_argument("--time-stretch-rates", type=float, nargs="*", default=[],
+                   help="augment the TRAIN split with time-stretched copies (rate factors, "
+                        "e.g. 0.9 1.1). Test split is NEVER augmented.")
+    p.add_argument("--pitch-backend", default="cpu", choices=["cpu", "gpu"],
+                   help="pitch-shift backend: 'cpu' (librosa, ~3.2s/clip) or 'gpu' "
+                        "(torchaudio PitchShift, ms/clip — use for GTSinger-scale data). "
+                        "GPU uses --device. Default cpu.")
     return p.parse_args()
 
 
@@ -230,6 +241,53 @@ def extract_vad(y, n_frames):
         if sf < ef:
             frame_vad[sf:ef] = 1.0
     return frame_vad
+
+
+# ── Pitch / time augmentation ─────────────────────────────────────────
+# librosa.effects.pitch_shift is brutally slow (phase vocoder, ~3.2 s per
+# 10 s clip). GTSinger is ~9.6k clips, so a CPU pitch-shift grid takes hours.
+# torchaudio's PitchShift runs the same operation on the GPU in milliseconds.
+# The CPU path stays available as a fallback (no torchaudio / no CUDA).
+
+_PITCH_SHIFTERS = {}   # (n_steps_rounded) -> torchaudio PitchShift module on device
+
+
+def _get_gpu_shifter(n_steps, device):
+    """Cache a torchaudio PitchShift per integer semitone step (modules are
+    expensive to build; n_steps is the only varying parameter)."""
+    import torch
+    from torchaudio.transforms import PitchShift
+    key = round(n_steps)
+    if key not in _PITCH_SHIFTERS:
+        _PITCH_SHIFTERS[key] = PitchShift(sample_rate=SR, n_steps=key).to(device)
+    return _PITCH_SHIFTERS[key]
+
+
+def _augment_variants(y, pitch_semitones, time_rates, pitch_backend, device):
+    """Yield (tag, audio): the original plus every pitch×time variant.
+
+    Transforms apply to raw audio BEFORE feature extraction so mel/F0/VAD are
+    re-derived (labels stay exact). Technique labels are pitch/tempo-invariant.
+    pitch_backend: 'cpu' (librosa) or 'gpu' (torchaudio, much faster).
+    Time-stretch always uses librosa (it is cheap: ~28 ms/clip)."""
+    import torch
+    pitches = [0.0] + [s for s in pitch_semitones if abs(s) > 1e-6]
+    rates   = [1.0] + [r for r in time_rates if abs(r - 1.0) > 1e-6]
+    for n_steps in pitches:
+        if abs(n_steps) < 1e-6:
+            y_p = y
+        elif pitch_backend == "gpu":
+            shifter = _get_gpu_shifter(n_steps, device)
+            with torch.no_grad():
+                t = torch.from_numpy(np.ascontiguousarray(y)).float().to(device)
+                y_p = shifter(t).cpu().numpy().astype(np.float32)
+        else:
+            y_p = librosa.effects.pitch_shift(y=y, sr=SR, n_steps=n_steps)
+        for rate in rates:
+            y_pr = (y_p if abs(rate - 1.0) < 1e-6
+                    else librosa.effects.time_stretch(y=y_p, rate=rate))
+            tag = f"p{n_steps:+g}_r{rate:g}" if (n_steps or rate != 1.0) else "orig"
+            yield tag, y_pr
 
 
 # ── Dataset loading ───────────────────────────────────────────────────
@@ -448,7 +506,8 @@ _FOLDER_TO_TECH = {
 
 
 def extract_from_wav_dir(audio_dir, rmvpe, device, min_frames, max_per_tech,
-                         test_singers=None):
+                         test_singers=None, pitch_semitones=(), time_rates=(),
+                         pitch_backend="cpu"):
     """Walk a raw GTSinger WAV directory and extract technique clips.
 
     Expected layout:
@@ -514,26 +573,32 @@ def extract_from_wav_dir(audio_dir, rmvpe, device, min_frames, max_per_tech,
             skip_reasons["audio_short"] += 1
             continue
 
-        log_mel = extract_mel(y)
-        f0_hz   = rmvpe.infer_from_audio(y, sample_rate=SR, device=device).astype(np.float32)
-        T       = min(len(log_mel), len(f0_hz))
-        if T < min_frames:
-            skip_reasons["frame_short"] += 1
-            continue
-
-        log_mel   = log_mel[:T]
-        f0_hz     = f0_hz[:T]
-        frame_vad = extract_vad(y, T)
-
         label = np.zeros(len(TECHNIQUE_NAMES), dtype=np.float32)
         label[tech_idx] = 1.0
+        rel_path = str(wav_path.relative_to(audio_dir))
 
-        res[0].append(log_mel)
-        res[1].append(f0_hz)
-        res[2].append(frame_vad)
-        res[3].append(label)
-        res[4].append(T)
-        res[5].append(str(wav_path.relative_to(audio_dir)))
+        # Augment train clips only; test split must stay clean (no inflated eval).
+        # RMVPE runs per variant so f0 is ground-truth on each transformed clip
+        # (a derived-f0 shortcut was rejected: it under-labels voicing ~8.6% of
+        # frames at phrase edges, creating a VAD↔f0 mismatch).
+        variants = (_augment_variants(y, pitch_semitones, time_rates,
+                                      pitch_backend, device)
+                    if (not is_test and (pitch_semitones or time_rates))
+                    else [("orig", y)])
+        for tag, y_var in variants:
+            log_mel = extract_mel(y_var)
+            f0_hz   = rmvpe.infer_from_audio(
+                y_var, sample_rate=SR, device=device).astype(np.float32)
+            T       = min(len(log_mel), len(f0_hz))
+            if T < min_frames:
+                skip_reasons["frame_short"] += 1
+                continue
+            res[0].append(log_mel[:T])
+            res[1].append(f0_hz[:T])
+            res[2].append(extract_vad(y_var, T))
+            res[3].append(label.copy())
+            res[4].append(T)
+            res[5].append(rel_path if tag == "orig" else f"{rel_path}#{tag}")
         counts[tech_idx] += 1
 
     total_skip = sum(skip_reasons.values())
@@ -610,9 +675,17 @@ def main():
                         "JA-Tenor-1", "ES-Soprano-1"}
         print(f"\nExtracting from WAV directory: {args.audio_dir}")
         print(f"  Test singers ({len(test_singers)}): {sorted(test_singers)}")
+        if args.pitch_shift_semitones or args.time_stretch_rates:
+            n_var = (len(args.pitch_shift_semitones) + 1) * (len(args.time_stretch_rates) + 1)
+            print(f"  TRAIN augmentation: pitch={args.pitch_shift_semitones or '—'} "
+                  f"time={args.time_stretch_rates or '—'} → {n_var}× variants/clip "
+                  f"(backend={args.pitch_backend}, test NOT augmented)")
         tr, te = extract_from_wav_dir(
             args.audio_dir, rmvpe, args.device, min_frames,
-            args.max_per_technique, test_singers=test_singers)
+            args.max_per_technique, test_singers=test_singers,
+            pitch_semitones=args.pitch_shift_semitones,
+            time_rates=args.time_stretch_rates,
+            pitch_backend=args.pitch_backend)
         save_split(os.path.join(args.output_dir, "technique_gtsinger_train.npz"),
                    *tr[:-1])
         save_split(os.path.join(args.output_dir, "technique_gtsinger_test.npz"),

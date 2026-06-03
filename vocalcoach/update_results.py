@@ -19,8 +19,9 @@ Usage
       --data-dir data \\
       --technique-dir data/vocalset
 
-  # Delete a run from all tables
+  # Delete one or more runs from all tables
   python vocalcoach/update_results.py --delete tcn_gtsinger_noncausal
+  python vocalcoach/update_results.py --delete run_a run_b run_c
 
   # Preview without writing
   python vocalcoach/update_results.py \\
@@ -506,11 +507,12 @@ def make_technique_row(num, name, tech, gt_tech=None):
         f1 = d.get("f1")
         return _f(f1) if f1 is not None else "—"
     mf1 = _f(tech["macro_f1"]) if tech else "—"
+    map_ = _f(tech.get("macro_ap")) if tech else "—"
     clip_acc = tech.get("clip_accuracy") if tech else None
     clip_s = f"{clip_acc:.1%}" if clip_acc is not None and clip_acc == clip_acc else "—"
     return (f"| {num} | `{name}` | "
             + " | ".join(c(n, tech) for n in TECHNIQUE_NAMES)
-            + f" | {mf1} | {clip_s} |")
+            + f" | {mf1} | {map_} | {clip_s} |")
 
 
 def make_gt_technique_row(num, name, gt_tech):
@@ -522,12 +524,13 @@ def make_gt_technique_row(num, name, gt_tech):
         f1 = d.get("f1")
         return _f(f1) if f1 is not None else "—"
     mf1 = _f(gt_tech["macro_f1"])
+    map_ = _f(gt_tech.get("macro_ap"))
     clip_acc = gt_tech.get("clip_accuracy")
     clip_s = f"{clip_acc:.1%}" if clip_acc is not None and clip_acc == clip_acc else "—"
     # Only the 3 GTSinger classes (belt/straight absent)
     return (f"| {num} | `{name}` | "
             f"{c('vibrato')} | {c('breathy')} | {c('falsetto')} | "
-            f"{mf1} | {clip_s} |")
+            f"{mf1} | {map_} | {clip_s} |")
 
 
 # ── Rebuild leaderboard from Runs rows ───────────────────────────────────────
@@ -662,7 +665,7 @@ def main():
                         "models with diffuse posteriors. Pitch-only models with sharper posteriors "
                         "diffuse pitch posteriors make the unvoiced state more competitive.")
     p.add_argument("--print-only",    action="store_true")
-    p.add_argument("--delete",        default=None, metavar="NAME")
+    p.add_argument("--delete",        nargs="+", default=None, metavar="NAME")
     args = p.parse_args()
 
     results_md = args.results_md or os.path.join(
@@ -670,7 +673,8 @@ def main():
     results_md = os.path.abspath(results_md)
 
     if args.delete:
-        delete_row(results_md, args.delete)
+        for name in args.delete:
+            delete_row(results_md, name)
         return
 
     if not args.run_dir:

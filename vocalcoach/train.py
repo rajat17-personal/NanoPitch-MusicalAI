@@ -187,6 +187,12 @@ parser.add_argument("--deep-note-head", action="store_true", default=False,
                          "--note-head is also set. Keeps the backbone gradient smaller "
                          "than a flat head, which reduces VAD catastrophic forgetting "
                          "in joint training — same motivation as --deep-technique-head.")
+parser.add_argument("--note-probe", action="store_true", default=False,
+                    help="train ONLY the note heads — backbone, VAD, pitch and technique "
+                         "all frozen. Preserves the gainaug OOD VAD intact (a normal note "
+                         "run with trainable VAD erodes OOD VDR 67%%->13%%). Use to add a "
+                         "note head to a finished backbone without touching its VAD/pitch. "
+                         "Requires --note-head. Mutually exclusive with --probe-mode.")
 parser.add_argument("--note-dirs", type=str, nargs="*", default=None,
                     help="directories containing note_train.npz for note onset/offset "
                          "supervision. If None while --note-head is set, note head "
@@ -194,6 +200,23 @@ parser.add_argument("--note-dirs", type=str, nargs="*", default=None,
 parser.add_argument("--w-note", type=float, default=1.0,
                     help="weight for note onset+offset loss (BCE). Only active with "
                          "--note-head. Default 1.0.")
+parser.add_argument("--note-batch-size", type=int, default=16,
+                    help="batch size for the note head's separate forward pass. The note "
+                         "head needs its own forward (aligned mel+labels), and two large "
+                         "forwards at the main batch size overflow VRAM → allocator thrash "
+                         "(~20x slowdown). The note set is tiny so 16 is plenty. 0 = use "
+                         "max(1, batch_size//4).")
+parser.add_argument("--w-note-metric", type=float, default=1.0,
+                    help="weight of note onset/offset F1 in the checkpoint-selection "
+                         "metric (only when --note-head). Selection becomes "
+                         "<base>+w*noteF1 so the saved checkpoint reflects note quality, "
+                         "not just technique/VAD. 0 = note F1 ignored in selection.")
+parser.add_argument("--note-pos-weight", type=float, default=1.0,
+                    help="positive-class weight for the note onset/offset BCE. Onsets are "
+                         "rare (~2-3%% of frames), so unweighted BCE collapses to predicting "
+                         "the base rate (flat ~0.03 everywhere, no usable peaks). Set to the "
+                         "inverse positive rate (~30-40) so the model is penalised for missing "
+                         "onsets. Default 1.0 (unweighted — known to under-train the head).")
 
 # ── Warm-up all heads before technique/quality ────────────────────────────────
 parser.add_argument("--warmup-heads-epochs", type=int, default=0,
@@ -295,6 +318,14 @@ parser.add_argument("--probe-mode", action="store_true",
                          "head_quality trains. When not set, only head_technique trains. "
                          "Use with --resume from a trained pitch+technique checkpoint. "
                          "Incompatible with --freeze-backbone-epochs.")
+parser.add_argument("--freeze-n-blocks", type=int, default=0,
+                    help="Partial backbone freezing for domain adaptation: freeze input_proj "
+                         "and the first N TCN blocks, keep the remaining blocks + attention "
+                         "layers + norm + all heads trainable. 0 (default) = no-op, fully "
+                         "standard training. Use with --resume to adapt a clean-trained backbone "
+                         "to a new acoustic domain (e.g. reverb) without wholesale drift — the "
+                         "early layers retain their clean low-level feature extractors. "
+                         "Ignored when --probe-mode is set (probe freezes everything).")
 
 # Curriculum training
 parser.add_argument("--curriculum", action="store_true",
@@ -348,6 +379,9 @@ parser.add_argument("--pitch-sigma", type=float, default=1.2,
 # Evaluation frequency
 parser.add_argument("--eval-every", type=int, default=5,
                     help="run evaluation every N epochs")
+parser.add_argument("--save-best-only", action="store_true",
+                    help="skip per-epoch epoch_NNN.pth checkpoints (which fill disk fast); "
+                         "best_loss.pth and best_metric.pth are still always saved.")
 
 # Early stopping
 parser.add_argument("--patience", type=int, default=0,
@@ -389,6 +423,23 @@ parser.add_argument("--p-clean", type=float, default=0.0,
 parser.add_argument("--snr-bias", type=float, default=1.0,
                     help="SNR draw exponent: <1 biases toward high SNR (cleaner), "
                          ">1 toward low SNR (noisier). 1.0 = uniform.")
+parser.add_argument("--gain-aug-db", type=float, default=0.0,
+                    help="Random amplitude attenuation for loudness robustness. Each "
+                         "sample is scaled down by a random gain drawn uniformly from "
+                         "[0, gain_aug_db] dB (a constant log-mel offset, applied after "
+                         "noise mixing so the whole signal+floor is attenuated together). "
+                         "Label-preserving — amplitude scaling does not move onsets/offsets "
+                         "— so unlike reverb it cannot misalign VAD/f0 labels. 0.0 (default) "
+                         "= off. Use e.g. 40 to teach the model to detect feeble vocals like "
+                         "the quiet Vocadito OOD clips. Requires --augment noise or noise_specaug.")
+parser.add_argument("--spec-tilt-db", type=float, default=0.0,
+                    help="Random spectral tilt / EQ for mic-room coloration robustness. "
+                         "Applies a smooth per-sample gain curve over the 40 mel bands "
+                         "(linear tilt + curvature, each drawn in [-spec_tilt_db, "
+                         "spec_tilt_db] dB). Frequency-only — does not move time/pitch, so "
+                         "labels stay valid (unlike reverb). Targets the train↔Vocadito "
+                         "spectral-coloration gap that gain-aug (flat across bands) does not. "
+                         "0.0 (default) = off. Try 6-10. Pairs with --gain-aug-db.")
 parser.add_argument("--freq-mask-param", type=int, default=4,
                     help="SpecAugment: max mel-band width per frequency mask")
 parser.add_argument("--n-freq-masks", type=int, default=2,
@@ -597,9 +648,15 @@ class NoteDataset(Dataset):
         seg_idx = self.rng.integers(len(self.segments))
         s, e = self.segments[seg_idx]
         t0 = self.rng.integers(0, e - s - self.seq_len + 1) + s
+        mel    = self.mel   [t0:t0 + self.seq_len].astype(np.float32)  # (T, 40)
         onset  = self.onset [t0:t0 + self.seq_len]        # (T,)
         offset = self.offset[t0:t0 + self.seq_len]        # (T,)
-        return onset, offset, np.float32(1.0)
+        # mel MUST be returned with the labels: the note head is scored against
+        # these onsets/offsets, so the model has to forward on THIS clip's mel.
+        # (Previously only labels were returned and the head was trained against
+        # the unrelated PitchVAD batch's mel — impossible to align, head collapsed
+        # to a constant.)
+        return mel, onset, offset, np.float32(1.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -622,8 +679,17 @@ class MseQualityDataset(Dataset):
         self.seq_len = seq_len
         data = np.load(npz_path, allow_pickle=True)
         self.mel    = data['mel']                           # (total_frames, 40) float16
-        self.scores = data['scores'].astype(np.float32)    # (n_clips,)
+        raw_scores  = data['scores'].astype(np.float32)    # (n_clips,)
         lengths     = data['lengths']
+
+        # Z-score targets to zero-mean/unit-variance. The quality head is
+        # randomly initialised near 0, so regressing raw SingMOS scores (μ≈3.67)
+        # wastes the MSE warmup chasing a mean offset instead of learning to
+        # rank — the cause of the V3 near-zero ρ and V2 sign inversion. We store
+        # (mean, std) so evalQuality can de-normalise predictions back to [1,5].
+        self.score_mean = float(raw_scores.mean())
+        self.score_std  = float(raw_scores.std() + 1e-6)
+        self.scores = (raw_scores - self.score_mean) / self.score_std
 
         self.segments = []
         offset = 0
@@ -635,7 +701,8 @@ class MseQualityDataset(Dataset):
 
         self.rng = np.random.default_rng()
         print(f"MseQualityDataset: {len(lengths)} clips "
-              f"({len(self.segments)} usable ≥{seq_len} frames) from {npz_path}")
+              f"({len(self.segments)} usable ≥{seq_len} frames) from {npz_path} "
+              f"| z-score μ={self.score_mean:.3f} σ={self.score_std:.3f}")
 
     def __len__(self):
         return len(self.segments) * 5   # multiple passes per clip per epoch
@@ -663,8 +730,15 @@ class CcmusicQualityDataset(Dataset):
         self.seq_len = seq_len
         data = np.load(npz_path, allow_pickle=True)
         self.mel    = data['mel']                            # (total_frames, 40) float16
-        self.scores = data['scores'].astype(np.float32)     # (n_clips, 9)
+        raw_scores  = data['scores'].astype(np.float32)     # (n_clips, 9)
         lengths     = data['lengths']
+
+        # Per-dimension z-scoring (each of the 9 expert dims has its own scale).
+        # Same rationale as MseQualityDataset — fixes the V2 sign inversion where
+        # the near-zero-init head mapped good singers to low raw scores.
+        self.score_mean = raw_scores.mean(axis=0).astype(np.float32)        # (9,)
+        self.score_std  = (raw_scores.std(axis=0) + 1e-6).astype(np.float32)  # (9,)
+        self.scores = (raw_scores - self.score_mean) / self.score_std
 
         self.segments = []
         offset = 0
@@ -677,7 +751,7 @@ class CcmusicQualityDataset(Dataset):
         self.rng = np.random.default_rng()
         print(f"CcmusicQualityDataset: {len(lengths)} clips "
               f"({len(self.segments)} usable), {self.scores.shape[1]}-dim targets "
-              f"from {npz_path}")
+              f"from {npz_path} | per-dim z-scored")
 
     def __len__(self):
         return len(self.segments) * 20   # small dataset — many windows per clip
@@ -743,13 +817,19 @@ class PairedQualityDataset(Dataset):
 def make_quality_loaders(args, seq_len, batch_size, num_workers):
     """Build DataLoaders for the active quality variant stages.
 
-    Returns a dict with keys from {'mse', 'ccmusic', 'pairs'} depending on variant.
-    Empty dict if quality_variant == 0.
+    Returns (loaders, norm_stats) where:
+      loaders    — dict with keys from {'mse', 'ccmusic', 'pairs'} per variant
+      norm_stats — dict of target normalisation stats to embed in the checkpoint
+                   so evalQuality can de-normalise predictions. Keys:
+                     'mse_mean'/'mse_std'         (scalar, V2/V3)
+                     'ccmusic_mean'/'ccmusic_std' (list of 9, V2)
+    Empty dict / {} if quality_variant == 0.
     """
     if args.quality_variant == 0:
-        return {}
+        return {}, {}
 
     loaders = {}
+    norm_stats = {}
 
     # Stage 1: MSE pretraining on SingMOS-Pro AudioScore scalars (Variants 2 and 3)
     if args.quality_variant in (2, 3):
@@ -758,6 +838,8 @@ def make_quality_loaders(args, seq_len, batch_size, num_workers):
                 "--quality-variant 2/3 requires --quality-mse-npz "
                 "(run scripts/prepareQualityData.py --singmos-scores-json ... first)")
         ds_mse = MseQualityDataset(args.quality_mse_npz, seq_len)
+        norm_stats['mse_mean'] = ds_mse.score_mean
+        norm_stats['mse_std']  = ds_mse.score_std
         loaders['mse'] = DataLoader(ds_mse, batch_size=batch_size, shuffle=True,
                                     drop_last=True, num_workers=num_workers,
                                     pin_memory=True,
@@ -770,6 +852,8 @@ def make_quality_loaders(args, seq_len, batch_size, num_workers):
                 "--quality-variant 2 requires --quality-ccmusic-npz "
                 "(run scripts/prepareQualityData.py --ccmusic-wavs-dir ... first)")
         ds_cc = CcmusicQualityDataset(args.quality_ccmusic_npz, seq_len)
+        norm_stats['ccmusic_mean'] = ds_cc.score_mean.tolist()
+        norm_stats['ccmusic_std']  = ds_cc.score_std.tolist()
         loaders['ccmusic'] = DataLoader(ds_cc, batch_size=min(16, batch_size),
                                         shuffle=True, drop_last=False,
                                         num_workers=num_workers, pin_memory=True,
@@ -786,7 +870,7 @@ def make_quality_loaders(args, seq_len, batch_size, num_workers):
                                   pin_memory=True,
                                   persistent_workers=(num_workers > 0))
 
-    return loaders
+    return loaders, norm_stats
 
 
 def make_joint_loader(pitch_vad_dir, technique_dirs, seq_len, batch_size,
@@ -970,6 +1054,51 @@ def augment_mel_batch(mel_clean, mel_noise, args, device):
     return mixed
 
 
+def gain_augment(mel, gain_aug_db, device):
+    """Random per-sample amplitude attenuation for loudness robustness.
+
+    Scales each sample down by a random gain drawn from [0, gain_aug_db] dB.
+    In linear audio this is multiplication by 10**(-g/20); in log-mel space
+    (these mels are raw log-mel) it is a constant subtraction:
+        mel - g * (ln(10) / 20)
+    Applied to the full (already noise-mixed) signal so the noise floor is
+    attenuated with the voice — mimicking a quiet, low-level recording like
+    the feeble Vocadito clips. Amplitude scaling does not move onsets/offsets,
+    so VAD/f0/note labels stay valid (unlike reverb).
+
+    No-op when gain_aug_db <= 0.
+    """
+    if gain_aug_db <= 0.0:
+        return mel
+    B = mel.size(0)
+    g_db = torch.rand(B, 1, 1, device=device) * gain_aug_db   # [0, gain_aug_db]
+    offset = g_db * (np.log(10.0) / 20.0)
+    return mel - offset
+
+
+def spectral_tilt_augment(mel, tilt_db, device):
+    """Random per-sample spectral tilt + curvature (a smooth EQ in log-mel space).
+
+    Simulates mic/room frequency coloration — the train↔Vocadito gap that gain-aug
+    did NOT cover (gain is flat across bands; real recordings shade the spectrum).
+    Builds a smooth gain curve over the 40 mel bands as a quadratic in normalised
+    band index n∈[-1,1]:  g(n) = a*n + b*(n²-⅓)  dB
+    where `a` (linear tilt, low↔high balance) and `b` (curvature, mid emphasis/dip)
+    are drawn per sample in [-tilt_db, tilt_db]. The (n²-⅓) term is zero-mean over
+    the band range so curvature doesn't also shift overall level. Converted to a
+    log-mel offset (÷ 20/ln10) and ADDED. Frequency-only — does not move onsets,
+    f0, or VAD boundaries, so all labels stay valid. No-op when tilt_db <= 0.
+    """
+    if tilt_db <= 0.0:
+        return mel
+    B, _, F = mel.size(0), mel.size(1), mel.size(2)
+    n = torch.linspace(-1.0, 1.0, F, device=device).view(1, 1, F)   # band axis
+    a = (torch.rand(B, 1, 1, device=device) * 2 - 1) * tilt_db       # linear tilt
+    b = (torch.rand(B, 1, 1, device=device) * 2 - 1) * tilt_db       # curvature
+    curve_db = a * n + b * (n * n - 1.0 / 3.0)                        # (B,1,F) dB
+    return mel + curve_db * (np.log(10.0) / 20.0)
+
+
 def spec_augment(mel, args):
     """SpecAugment: independent random frequency and time masking per sample.
 
@@ -1126,8 +1255,17 @@ def compute_loss(pred_vad, pred_pitch, pred_technique,
         if note_mask.sum() > 0:
             onset_loss  = bce_none(note_onset.squeeze(-1),  note_onset_target)   # (B, T)
             offset_loss = bce_none(note_offset.squeeze(-1), note_offset_target)  # (B, T)
-            note_loss = ((note_mask.squeeze(-1) * onset_loss).sum()
-                         + (note_mask.squeeze(-1) * offset_loss).sum()) / \
+            # Positive-class weighting: onsets/offsets are rare (~2-3% of frames),
+            # so unweighted BCE collapses to the base rate. Upweight positive
+            # (boundary) frames so missing an onset is penalised heavily.
+            on_w  = torch.where(note_onset_target  > 0.5,
+                                torch.full_like(note_onset_target,  args.note_pos_weight),
+                                torch.ones_like(note_onset_target))
+            off_w = torch.where(note_offset_target > 0.5,
+                                torch.full_like(note_offset_target, args.note_pos_weight),
+                                torch.ones_like(note_offset_target))
+            note_loss = ((note_mask.squeeze(-1) * on_w  * onset_loss).sum()
+                         + (note_mask.squeeze(-1) * off_w * offset_loss).sum()) / \
                         (note_mask.sum() * note_onset_target.shape[1] * 2)
         total = total + args.w_note * note_loss
 
@@ -1141,6 +1279,10 @@ def compute_quality_loss(model, quality_batch, device, args, epoch):
       'mse':     (mel, score) from MseQualityDataset — scalar AudioScore targets
       'ccmusic': (mel, scores_9d) from CcmusicQualityDataset — 9-dim expert targets
       'pairs':   (mel_pro, mel_am) from PairedQualityDataset — contrastive pairs
+
+    `epoch` here is the RESUME-RELATIVE epoch (1-based, counted from the start of
+    this run, not the absolute checkpoint epoch) so the MSE warmup stage fires
+    correctly even when resuming from a high-epoch Stage-1 backbone.
 
     Returns (total_quality_loss, loss_dict) where loss_dict has per-component values.
     Active stages depend on variant and epoch:
@@ -1217,8 +1359,23 @@ def _get_w_technique(epoch, args):
     return args.w_technique * ramp_progress / args.curriculum_ramp
 
 
+def _pin_frozen_bn_eval(model):
+    """Put BatchNorm modules of frozen top-level groups into .eval() so their
+    running stats stop updating. Must be re-called after every model.train()
+    (which flips ALL modules back to train mode). Reads model._frozen_tops set by
+    _set_backbone_frozen; no-op when nothing is frozen (full fine-tune)."""
+    frozen_tops = getattr(model, "_frozen_tops", None)
+    if not frozen_tops:
+        return
+    for mod_name, module in model.named_modules():
+        top = mod_name.split(".")[0] if mod_name else ""
+        if top in frozen_tops and isinstance(
+                module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.SyncBatchNorm)):
+            module.eval()
+
+
 def _set_backbone_frozen(model, frozen: bool, probe_mode: bool = False,
-                         quality_probe: bool = False):
+                         quality_probe: bool = False, note_probe: bool = False):
     """Freeze or unfreeze backbone weights.
 
     quality_probe=True: freeze everything except head_quality — used when
@@ -1231,6 +1388,10 @@ def _set_backbone_frozen(model, frozen: bool, probe_mode: bool = False,
     """
     if quality_probe:
         trainable_tops = {"head_quality"}
+    elif note_probe:
+        # Train ONLY the note heads — backbone + VAD + pitch + technique all frozen.
+        # Keeps the gainaug VAD intact (note training otherwise erodes OOD VDR 67→13%).
+        trainable_tops = {"head_note_onset", "head_note_offset"}
     elif probe_mode:
         trainable_tops = {"head_technique"}
     elif frozen:
@@ -1245,15 +1406,56 @@ def _set_backbone_frozen(model, frozen: bool, probe_mode: bool = False,
         else:
             param.requires_grad = (top in trainable_tops)
 
+    # Record which top-level groups are frozen so their BatchNorm stats can be
+    # re-pinned after every model.train() (see _pin_frozen_bn_eval). requires_grad=
+    # False only stops gradient updates — BatchNorm still updates running_mean/var on
+    # every forward in .train() mode. During a probe the quality/technique data has a
+    # different distribution, so those stats drift and silently corrupt the (frozen)
+    # VAD/pitch heads — observed as OOD VDR collapsing 67%->19%.
+    model._frozen_tops = (None if trainable_tops is None
+                          else set(n.split(".")[0] for n, _ in model.named_parameters()
+                                   if n.split(".")[0] not in trainable_tops))
+    _pin_frozen_bn_eval(model)
+
     state = "FROZEN" if (frozen or probe_mode or quality_probe) else "unfrozen"
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Backbone {state} — {trainable:,} trainable parameters")
 
 
+def _freeze_first_n_blocks(model, n_blocks: int):
+    """Partial backbone freeze for domain adaptation.
+
+    Freezes input_proj and the first `n_blocks` TCN blocks; everything else
+    (remaining blocks, attention layers, norm, all heads) stays trainable.
+    Low-level spectral feature extractors are preserved while the top of the
+    network adapts to a new acoustic domain.
+
+    Called once after model construction/resume. A strict no-op when
+    n_blocks <= 0, so default training is completely unaffected.
+    """
+    if n_blocks <= 0:
+        return  # no-op: standard full-network training
+
+    frozen_prefixes = ["input_proj"]
+    frozen_prefixes += [f"blocks.{i}." for i in range(n_blocks)]
+
+    n_frozen = 0
+    for name, param in model.named_parameters():
+        if name.startswith("input_proj") or any(
+                name.startswith(p) for p in frozen_prefixes):
+            param.requires_grad = False
+            n_frozen += param.numel()
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Partial freeze: input_proj + first {n_blocks} TCN blocks frozen "
+          f"({n_frozen:,} params); {trainable:,} trainable "
+          f"(top blocks + attn + heads)")
+
+
 def train_one_epoch(model, loader, optimizer, scheduler, writer,
                     epoch, device, args, noise_pool=None,
                     global_step_offset=0, quality_loaders=None,
-                    note_loader=None):
+                    note_loader=None, start_epoch=1):
     """Train for one epoch.
 
     quality_loaders: dict returned by make_quality_loaders, or None/empty.
@@ -1262,6 +1464,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, writer,
       quality_variant > 0 and probe_mode is set — only head_quality trains.
     """
     model.train()
+    _pin_frozen_bn_eval(model)   # re-pin frozen BN to eval (model.train() unset it)
     running = {'total': 0.0, 'vad': 0.0, 'pitch': 0.0, 'technique': 0.0,
                'note': 0.0, 'contrastive': 0.0,
                'quality_mse': 0.0, 'quality_ccmusic': 0.0, 'quality_ranking': 0.0}
@@ -1276,13 +1479,20 @@ def train_one_epoch(model, loader, optimizer, scheduler, writer,
 
     # When training quality head, the main pitch/technique loader is skipped —
     # we iterate quality loaders directly. Use the 'pairs' loader to set epoch length.
+    # When stdout is piped (e.g. `… | tee log`), it is not a TTY so tqdm cannot
+    # overwrite in place with '\r' — every refresh becomes a NEW line, flooding the
+    # log with one line per batch. Throttle to a sparse interval in that case so the
+    # log gets ~one progress line per epoch instead of hundreds.
+    import sys as _sys
+    _tty = _sys.stderr.isatty()
+    _bar_kw = dict(unit="batch") if _tty else dict(unit="batch", mininterval=30.0)
     if is_quality_only:
         primary_iter = iter(quality_loaders.get('pairs', []))
         pbar = tqdm(quality_loaders.get('pairs', []),
-                    desc=f"Epoch {epoch} [quality]", unit="batch")
+                    desc=f"Epoch {epoch} [quality]", **_bar_kw)
     else:
         primary_iter = None
-        pbar = tqdm(loader, desc=f"Epoch {epoch}", unit="batch")
+        pbar = tqdm(loader, desc=f"Epoch {epoch}", **_bar_kw)
 
     def _next_quality(key):
         """Draw next batch from a quality loader, cycling if exhausted."""
@@ -1301,7 +1511,13 @@ def train_one_epoch(model, loader, optimizer, scheduler, writer,
             if 'ccmusic' in quality_loaders:
                 quality_batch['ccmusic'] = _next_quality('ccmusic')
 
-            total, q_losses = compute_quality_loss(model, quality_batch, device, args, epoch)
+            # Gate the MSE warmup on epochs-since-resume, not the absolute epoch.
+            # Quality runs resume from a Stage-1 backbone at a high epoch number
+            # (e.g. 326); --quality-epochs-mse N must mean "first N epochs of THIS
+            # run" so the z-scored MSE calibration stage actually fires.
+            resume_epoch = epoch - start_epoch + 1
+            total, q_losses = compute_quality_loss(
+                model, quality_batch, device, args, resume_epoch)
 
             optimizer.zero_grad()
             total.backward()
@@ -1345,36 +1561,43 @@ def train_one_epoch(model, loader, optimizer, scheduler, writer,
                 noise_np = noise_pool.draw_batch(B)
                 noise_t  = torch.from_numpy(noise_np).to(device)
                 mel = augment_mel_batch(mel, noise_t, args, device)
+            if args.gain_aug_db > 0.0:
+                mel = gain_augment(mel, args.gain_aug_db, device)
+            if args.spec_tilt_db > 0.0:
+                mel = spectral_tilt_augment(mel, args.spec_tilt_db, device)
             if do_specaug:
                 mel = spec_augment(mel, args)
 
+            # Note outputs from the main pass are discarded (`_`): the main batch
+            # carries no note labels. The note head is trained on its own aligned
+            # mel in the note block below.
             if use_contrastive:
-                pred_vad, pred_pitch, pred_technique, _, note_onset, note_offset, embeddings = model(
+                pred_vad, pred_pitch, pred_technique, _, _, _, embeddings = model(
                     mel, return_embeddings=True)
             else:
-                pred_vad, pred_pitch, pred_technique, _, note_onset, note_offset = model(mel)
+                pred_vad, pred_pitch, pred_technique, _, _, _ = model(mel)
 
             # Warmup: suppress technique loss until pitch/VAD/note have converged
             effective_w_technique = 0.0 if warmup_active else _get_w_technique(epoch, args)
 
-            # Note targets — draw from note_loader if available, else zeros
-            if use_note_head:
-                if note_iter is not None:
-                    try:
-                        note_batch = next(note_iter)
-                    except StopIteration:
-                        note_iter = iter(note_loader)
-                        note_batch = next(note_iter)
-                    note_onset_tgt  = note_batch[0].to(device)  # (B, T)
-                    note_offset_tgt = note_batch[1].to(device)  # (B, T)
-                    has_note_batch  = note_batch[2].to(device)  # (B,)
-                else:
-                    B_n, T_n = mel.shape[0], mel.shape[1]
-                    note_onset_tgt  = torch.zeros(B_n, T_n, device=device)
-                    note_offset_tgt = torch.zeros(B_n, T_n, device=device)
-                    has_note_batch  = torch.zeros(B_n, device=device)
-            else:
-                note_onset_tgt = note_offset_tgt = has_note_batch = None
+            # Note head — forward on the NOTE loader's OWN mel so predictions and
+            # onset/offset labels are aligned (a separate forward pass, like the
+            # quality heads). The main `mel` pass above carries no note labels, so
+            # its note outputs are discarded for the note loss.
+            note_onset = note_offset = None
+            note_onset_tgt = note_offset_tgt = has_note_batch = None
+            if use_note_head and note_iter is not None:
+                try:
+                    note_batch = next(note_iter)
+                except StopIteration:
+                    note_iter = iter(note_loader)
+                    note_batch = next(note_iter)
+                note_mel        = note_batch[0].to(device)  # (B, T, 40)
+                note_onset_tgt  = note_batch[1].to(device)  # (B, T)
+                note_offset_tgt = note_batch[2].to(device)  # (B, T)
+                has_note_batch  = note_batch[3].to(device)  # (B,)
+                n_out = model(note_mel)
+                note_onset, note_offset = n_out[4], n_out[5]
 
             total, vad_l, pitch_l, tech_l, note_l = compute_loss(
                 pred_vad, pred_pitch, pred_technique,
@@ -1591,28 +1814,112 @@ def evaluate(model, data_dir, technique_dirs, writer, epoch, device, args):
         all_true = np.stack(all_true)   # (N, N_TECH)
         pred_bin = (all_pred > 0.5).astype(int)
 
-        print(f"\n  {'Technique':<12}  {'Prec':>6}  {'Recall':>6}  {'F1':>6}  {'AP':>6}")
-        print(f"  {'─'*12}  {'─'*6}  {'─'*6}  {'─'*6}  {'─'*6}")
-        f1s, aps = [], []
+        # Per-column F1 at a fixed threshold (helper for the best-threshold sweep).
+        def _f1_at(true_k, prob_k, thr):
+            _, _, f1k, _ = precision_recall_fscore_support(
+                true_k, (prob_k > thr).astype(int),
+                average='binary', zero_division=0)
+            return f1k
+
+        print(f"\n  {'Technique':<12}  {'Prec':>6}  {'Recall':>6}  {'F1@.5':>6}  "
+              f"{'AP':>6}  {'F1*':>6}  {'thr*':>5}")
+        print(f"  {'─'*12}  {'─'*6}  {'─'*6}  {'─'*6}  {'─'*6}  {'─'*6}  {'─'*5}")
+        f1s, aps, f1s_best = [], [], []
+        best_thresholds = {}
+        # Candidate thresholds for the per-class sweep (0.05 … 0.95).
+        thr_grid = np.linspace(0.05, 0.95, 19)
         for k, name in enumerate(TECHNIQUE_NAMES):
             if all_true[:, k].sum() == 0:
                 continue
             p, r, f1, _ = precision_recall_fscore_support(
                 all_true[:, k], pred_bin[:, k], average='binary', zero_division=0)
             ap = average_precision_score(all_true[:, k], all_pred[:, k])
-            print(f"  {name:<12}  {p:6.3f}  {r:6.3f}  {f1:6.3f}  {ap:6.3f}")
+            # Best-threshold F1: the highest F1 achievable at SOME cutoff. Threshold-
+            # free in spirit (sweeps), so it doesn't suffer the 0.5-cliff noise and
+            # surfaces the cutoff you'd actually deploy. Logged for reference; the
+            # checkpoint is selected on AP (no threshold-overfit risk on 203 clips).
+            f1_by_thr = [(_f1_at(all_true[:, k], all_pred[:, k], t), t) for t in thr_grid]
+            f1_best, thr_best = max(f1_by_thr, key=lambda x: x[0])
+            best_thresholds[name] = float(thr_best)
+            print(f"  {name:<12}  {p:6.3f}  {r:6.3f}  {f1:6.3f}  {ap:6.3f}  "
+                  f"{f1_best:6.3f}  {thr_best:5.2f}")
             f1s.append(f1)
             aps.append(ap)
+            f1s_best.append(f1_best)
             writer.add_scalar(f"eval/f1_{name}", f1, epoch)
             writer.add_scalar(f"eval/ap_{name}", ap, epoch)
+            writer.add_scalar(f"eval/f1best_{name}", f1_best, epoch)
 
-        macro_f1 = float(np.mean(f1s)) if f1s else float('nan')
-        macro_ap = float(np.mean(aps)) if aps else float('nan')
-        results['macro_f1'] = macro_f1
-        results['macro_ap'] = macro_ap
+        macro_f1      = float(np.mean(f1s))      if f1s      else float('nan')
+        macro_ap      = float(np.mean(aps))      if aps      else float('nan')
+        macro_f1_best = float(np.mean(f1s_best)) if f1s_best else float('nan')
+        results['macro_f1']      = macro_f1
+        results['macro_ap']      = macro_ap
+        results['macro_f1_best'] = macro_f1_best
+        results['best_thresholds'] = best_thresholds
         writer.add_scalar("eval/macro_f1", macro_f1, epoch)
         writer.add_scalar("eval/macro_ap", macro_ap, epoch)
-        print(f"  Macro F1: {macro_f1:.4f}  Macro AP: {macro_ap:.4f}")
+        writer.add_scalar("eval/macro_f1_best", macro_f1_best, epoch)
+        print(f"  Macro F1@.5: {macro_f1:.4f}  Macro AP: {macro_ap:.4f}  "
+              f"Macro F1*: {macro_f1_best:.4f} (best-threshold)")
+
+    # ── Note onset/offset F1 (only when the note head is active) ─────────────
+    # Gives the note head its own selection signal. Reuses the peak-pick + greedy
+    # matching from scripts/evalNoteHead.py (±50 ms tolerance). Without this the
+    # note head is never optimised for — best_metric is chosen on technique/VAD.
+    if getattr(args, 'note_head', False):
+        note_npz = None
+        for tdir in (technique_dirs or []):
+            _p = os.path.join(tdir, "note_test.npz")
+            if os.path.exists(_p):
+                note_npz = _p
+                break
+        if note_npz is None and data_dir:
+            _p = os.path.join(data_dir, "note_test.npz")
+            note_npz = _p if os.path.exists(_p) else None
+        if note_npz is not None:
+            try:
+                import sys as _sys
+                _sd = os.path.join(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__))), "scripts")
+                if _sd not in _sys.path:
+                    _sys.path.insert(0, _sd)
+                from evalNoteHead import _pick_peaks, _match_f1
+                nd = np.load(note_npz, allow_pickle=True)
+                nmel = nd["mel"].astype(np.float32)
+                nlen = nd["lengths"].astype(np.int64)
+                on_idx  = nd["note_onsets"].astype(np.int64)
+                off_idx = nd["note_offsets"].astype(np.int64)
+                nclip   = nd["note_clip"].astype(np.int64)
+                tol = 5   # ±50 ms at 10 ms hop
+                agg = {"on": [0, 0, 0], "off": [0, 0, 0]}  # tp, n_pred, n_ref
+                off0 = 0
+                for ci, L in enumerate(nlen):
+                    L = int(L)
+                    cm = nmel[off0:off0 + L]; cs = off0; off0 += L
+                    with torch.no_grad():
+                        o = model(torch.from_numpy(cm).unsqueeze(0).to(device))
+                    p_on  = o[4].squeeze(0).squeeze(-1).cpu().numpy()
+                    p_off = o[5].squeeze(0).squeeze(-1).cpu().numpy()
+                    for kind, prob, ref_idx in (("on", p_on, on_idx), ("off", p_off, off_idx)):
+                        pk = _pick_peaks(prob, 0.5, 5)
+                        ref = np.sort(ref_idx[nclip == ci] - cs)
+                        ref = ref[(ref >= 0) & (ref < L)]
+                        _, _, _, tp = _match_f1(pk, ref, tol)
+                        agg[kind][0] += tp; agg[kind][1] += len(pk); agg[kind][2] += len(ref)
+                def _f1(a):
+                    tp, npd, nrf = a
+                    pr = tp / npd if npd else 0.0; rc = tp / nrf if nrf else 0.0
+                    return 2 * pr * rc / (pr + rc) if (pr + rc) > 0 else 0.0
+                on_f1, off_f1 = _f1(agg["on"]), _f1(agg["off"])
+                note_f1 = float((on_f1 + off_f1) / 2)
+                results['note_f1'] = note_f1
+                writer.add_scalar("eval/note_onset_f1", on_f1, epoch)
+                writer.add_scalar("eval/note_offset_f1", off_f1, epoch)
+                writer.add_scalar("eval/note_f1", note_f1, epoch)
+                print(f"  Note F1: onset={on_f1:.3f} offset={off_f1:.3f} mean={note_f1:.3f}")
+            except Exception as e:
+                print(f"  Note eval skipped: {e}")
 
     print()
     return results
@@ -1657,6 +1964,20 @@ def main():
         raise RuntimeError("--quality-variant requires --probe-mode")
     if args.quality_variant > 0 and not args.resume:
         raise RuntimeError("--quality-variant requires --resume (trained pitch+technique checkpoint)")
+
+    # --freeze-n-blocks guards: it owns its own (single-group) optimizer rebuild,
+    # so it must not be combined with the strategies that also restructure
+    # param groups or freezing.
+    if args.freeze_n_blocks > 0:
+        if args.probe_mode or args.quality_variant > 0:
+            raise RuntimeError("--freeze-n-blocks is incompatible with --probe-mode / "
+                               "--quality-variant (those already freeze the whole backbone)")
+        if args.freeze_backbone_epochs > 0:
+            raise RuntimeError("--freeze-n-blocks is incompatible with "
+                               "--freeze-backbone-epochs (conflicting freeze schedules)")
+        if args.lr_backbone is not None:
+            raise RuntimeError("--freeze-n-blocks is incompatible with --lr-backbone "
+                               "(both are gentle-adaptation strategies; pick one)")
 
     # Build model — quality_head dim: 0=off, 1=scalar, 9=multi-dim
     quality_head_dim = {0: 0, 1: 1, 2: 9, 3: 1}[args.quality_variant]
@@ -1712,8 +2033,10 @@ def main():
 
     # Data
     quality_loaders = {}
+    quality_norm_stats = {}
     if args.quality_variant > 0:
-        quality_loaders = make_quality_loaders(args, args.seq_len, args.batch_size, args.num_workers)
+        quality_loaders, quality_norm_stats = make_quality_loaders(
+            args, args.seq_len, args.batch_size, args.num_workers)
         # Quality training doesn't need the main pitch/VAD/technique loader
         loader = None
         pretrain_loader = None
@@ -1747,12 +2070,18 @@ def main():
                 print(f"  [warn] note_train.npz not found in {nd} — skipping")
         if note_datasets:
             note_ds = ConcatDataset(note_datasets) if len(note_datasets) > 1 else note_datasets[0]
-            note_loader = DataLoader(note_ds, batch_size=args.batch_size, shuffle=True,
+            # The note head trains via a SECOND forward pass per step (its mel must
+            # be aligned with its labels). At the main batch size + seq 600 + O(T²)
+            # attention, two large forwards overflow VRAM and the allocator thrashes
+            # (~20× slowdown). The note set is tiny (≈3.7k samples/epoch), so a small
+            # note batch is both sufficient and far faster.
+            note_bs = args.note_batch_size or max(1, args.batch_size // 4)
+            note_loader = DataLoader(note_ds, batch_size=note_bs, shuffle=True,
                                      drop_last=True, num_workers=args.num_workers,
                                      pin_memory=True,
                                      persistent_workers=(args.num_workers > 0))
             print(f"Note loader: {len(note_datasets)} source(s), "
-                  f"{len(note_ds)} samples/epoch")
+                  f"{len(note_ds)} samples/epoch, note_batch={note_bs}")
 
     # Optimizer + scheduler
     # Split into two param groups when --lr-backbone is set so the backbone
@@ -1791,7 +2120,8 @@ def main():
         args._sched_step = "iter"
 
     if resume_ckpt:
-        _param_groups_changed = args.probe_mode or (args.lr_backbone is not None)
+        _param_groups_changed = (args.probe_mode or (args.lr_backbone is not None)
+                                 or args.freeze_n_blocks > 0)
         if "optimizer" in resume_ckpt and not _param_groups_changed:
             saved_groups  = resume_ckpt["optimizer"].get("param_groups", [])
             current_groups = optimizer.param_groups
@@ -1806,7 +2136,12 @@ def main():
                       f"model has {[len(g['params']) for g in current_groups]}) — "
                       f"architecture changed, starting with fresh optimizer.")
         elif "optimizer" in resume_ckpt and _param_groups_changed:
-            reason = "probe mode" if args.probe_mode else "differential LR (param groups changed)"
+            if args.probe_mode:
+                reason = "probe mode"
+            elif args.freeze_n_blocks > 0:
+                reason = f"partial freeze (first {args.freeze_n_blocks} blocks — param groups changed)"
+            else:
+                reason = "differential LR (param groups changed)"
             print(f"  Skipping optimizer state: {reason}")
         if "scheduler" in resume_ckpt and not _param_groups_changed:
             try:
@@ -1827,11 +2162,15 @@ def main():
         _set_backbone_frozen(model, frozen=True, quality_probe=True)
         print(f"  Quality probe (variant {args.quality_variant}): "
               f"only head_quality trains for all {args.epochs} epochs")
+    elif getattr(args, 'note_probe', False):
+        _set_backbone_frozen(model, frozen=True, note_probe=True)
+        print(f"  Note probe: only note heads train; backbone+VAD+pitch+technique "
+              f"frozen (preserves OOD VAD) for all {args.epochs} epochs")
     elif args.probe_mode:
         _set_backbone_frozen(model, frozen=True, probe_mode=True)
         print(f"  Probe mode: backbone + pitch/VAD heads frozen for all {args.epochs} epochs")
 
-    if args.probe_mode or args.quality_variant > 0:
+    if args.probe_mode or args.quality_variant > 0 or getattr(args, 'note_probe', False):
         # Rebuild optimizer over trainable params only so frozen params get no momentum state
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, model.parameters()),
@@ -1843,6 +2182,20 @@ def main():
         _set_backbone_frozen(model, frozen=True)
         print(f"  Backbone frozen for epochs {start_epoch}–{freeze_until - 1}, "
               f"unfreezes at epoch {freeze_until}")
+
+    # Partial freeze for domain adaptation (no-op when --freeze-n-blocks 0).
+    # Only meaningful in normal joint training — probe/quality modes already
+    # froze the whole backbone above, and the timed freeze-backbone-epochs path
+    # owns its own freeze/unfreeze schedule.
+    if (not args.probe_mode and args.quality_variant == 0
+            and args.freeze_backbone_epochs == 0 and args.freeze_n_blocks > 0):
+        _freeze_first_n_blocks(model, args.freeze_n_blocks)
+        # Rebuild optimizer over trainable params only so frozen blocks get no
+        # momentum state (mirrors the probe-mode optimizer rebuild above).
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=args.lr, betas=(0.9, 0.98), weight_decay=1e-4,
+        )
 
     ref_loader_len = len(quality_loaders.get('pairs', loader)) if quality_loaders else len(loader)
 
@@ -1877,6 +2230,7 @@ def main():
             global_step_offset=global_step,
             quality_loaders=quality_loaders if args.quality_variant > 0 else None,
             note_loader=note_loader,
+            start_epoch=start_epoch,
         )
         global_step += ref_loader_len
 
@@ -1909,8 +2263,13 @@ def main():
             "model_kwargs": model_kwargs,
             "args": vars(args),
             "loss": train_loss,
+            "quality_norm": quality_norm_stats,
         }
-        torch.save(ckpt, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pth"))
+        # Per-epoch checkpoints fill disk fast (~31MB × hundreds of epochs).
+        # --save-best-only skips them; best_loss.pth and best_metric.pth are
+        # always saved regardless, so the two checkpoints you actually use survive.
+        if not args.save_best_only:
+            torch.save(ckpt, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pth"))
 
         if train_loss < best_loss:
             best_loss = train_loss
@@ -1926,13 +2285,22 @@ def main():
             else:
                 eval_res = evaluate(model, eval_dir, tech_dirs,
                                     writer, epoch, device, args)
-                if 'macro_f1' in eval_res:
+                if 'macro_ap' in eval_res:
+                    # Select on macro AP (threshold-free) instead of macro F1@0.5.
+                    # F1 at the fixed 0.5 cutoff bounces ±0.1 epoch-to-epoch when a
+                    # class's probability sits near 0.5 (a tiny weight change flips
+                    # the hard prediction), so it makes checkpoint selection noisy.
+                    # AP integrates over all thresholds — stable, and a better proxy
+                    # for separability. macro_f1_best (F1 at the per-class optimal
+                    # threshold) is computed and logged for reference / deploy
+                    # thresholds but does NOT drive selection (avoids overfitting a
+                    # threshold to the small 203-clip eval set).
                     # Default 0.0: missing vf1_clean means VAD head is dead (no
-                    # voiced predictions at all) — should not get a free 1.0 score.
+                    # voiced predictions at all) — should not get a free score.
                     vf1_clean = eval_res.get('vf1_clean', 0.0)
                     w = args.metric_vdr_weight
-                    metric = eval_res['macro_f1'] + w * vf1_clean
-                    metric_name = f"f1+{w}*vf1"
+                    metric = eval_res['macro_ap'] + w * vf1_clean
+                    metric_name = f"ap+{w}*vf1"
                 elif 'macro_rpa' in eval_res:
                     # Use RPA + w*vF1_clean so the checkpoint reflects both pitch
                     # accuracy and VAD quality. vF1 balances VAD precision and
@@ -1956,6 +2324,16 @@ def main():
                 else:
                     metric = float('nan')
                     metric_name = "none"
+
+                # Note head: fold note F1 into selection so the note head is
+                # actually optimised for (otherwise best_metric is chosen purely on
+                # technique/VAD and the saved note head is whatever happened to
+                # coincide). Only active with --note-head; weighted by --w-note-metric.
+                if (getattr(args, 'note_head', False)
+                        and 'note_f1' in eval_res and not np.isnan(metric)):
+                    wn = getattr(args, 'w_note_metric', 1.0)
+                    metric = metric + wn * eval_res['note_f1']
+                    metric_name = f"{metric_name}+{wn}*noteF1"
         else:
             eval_res = {}
 

@@ -205,13 +205,29 @@ def save_tracker(tracker: dict, log_path: str):
         json.dump(tracker, f, indent=2)
 
 
+# Runs whose VDR is below this are treated as VAD-collapsed: their pitch
+# metrics (RPA/RCA) are computed on a tiny, easy subset of voiced frames and
+# are not representative, so they must not set any "best-so-far" baseline.
+# (e.g. a model predicting ~everything unvoiced can report RPA≈100% at VDR≈0%.)
+MIN_VALID_VDR = 0.30
+
+
 def best_so_far(tracker: dict, dataset: str) -> dict:
     """
     For each metric, return the best value seen across all runs on this dataset.
     Higher-is-better metrics take the max; lower-is-better take the min.
     Returns {} if no prior runs exist for this dataset.
+
+    Runs with VDR < MIN_VALID_VDR are excluded from baseline computation: a
+    collapsed VAD makes that run's pitch metrics meaningless (RPA/RCA measured
+    on a thin subset), so it must not poison the baseline other runs compete
+    against.
     """
     prior = [r for r in tracker.get("runs", []) if r.get("dataset") == dataset]
+    # Drop VAD-collapsed runs so they can't set a spurious best.
+    valid = [r for r in prior
+             if r.get("overall", {}).get("vdr", 0.0) >= MIN_VALID_VDR]
+    prior = valid if valid else prior  # fall back if nothing clears the floor
     if not prior:
         return {}
     best = {}

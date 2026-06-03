@@ -131,6 +131,16 @@ def parse_args():
                         "(default: m2 f4)")
     p.add_argument("--min-duration", type=float, default=0.5,
                    help="skip clips shorter than this many seconds (default: 0.5)")
+    p.add_argument("--pitch-shift-semitones", type=float, nargs="*", default=[],
+                   help="augment the TRAIN split with pitch-shifted copies (semitones, "
+                        "e.g. -2 2). Technique is pitch-invariant (a belt stays a belt), "
+                        "and f0/VAD/mel are re-derived from shifted audio, so all labels "
+                        "stay exact. Test split is NEVER augmented. Crosses with "
+                        "--time-stretch-rates as a grid.")
+    p.add_argument("--time-stretch-rates", type=float, nargs="*", default=[],
+                   help="augment the TRAIN split with time-stretched copies (rate factors, "
+                        "e.g. 0.9 1.1). Technique is tempo-invariant; labels re-derived. "
+                        "Test split is NEVER augmented.")
     return p.parse_args()
 
 
@@ -187,6 +197,10 @@ def discover_clips(dataset_dir):
             continue
         # Walk all subdirectories; pick up any folder whose name is a technique.
         for root, _, fnames in os.walk(singer_path):
+            # Skip macOS AppleDouble junk (__MACOSX/ tree + "._name.wav" stubs)
+            # that Mac-created zips carry — they aren't real audio.
+            if "__MACOSX" in root.split(os.sep):
+                continue
             tech_folder = os.path.basename(root)
             if tech_folder not in VOCALSET_MAP:
                 continue
@@ -194,13 +208,34 @@ def discover_clips(dataset_dir):
             for fname in sorted(fnames):
                 if os.path.splitext(fname)[1].lower() not in audio_exts:
                     continue
+                if fname.startswith("._"):
+                    continue
                 clips.append((singer_id, tech_idx, os.path.join(root, fname)))
     return clips
 
 
 # ── Per-split extraction ──────────────────────────────────────────────
 
-def extract_split(clips, rmvpe, device, min_frames, split_name):
+def _augment_variants(y, sr, pitch_semitones, time_rates):
+    """Yield (label, audio): the original plus every pitch×time variant.
+
+    Transforms are applied to raw audio BEFORE feature extraction, so mel/F0/VAD
+    re-derive correctly aligned. Technique labels are pitch- and tempo-invariant,
+    so they carry over unchanged. The unmodified original is always included."""
+    pitches = [0.0] + [s for s in pitch_semitones if abs(s) > 1e-6]
+    rates   = [1.0] + [r for r in time_rates if abs(r - 1.0) > 1e-6]
+    for n_steps in pitches:
+        y_p = (y if abs(n_steps) < 1e-6
+               else librosa.effects.pitch_shift(y=y, sr=sr, n_steps=n_steps))
+        for rate in rates:
+            y_pr = (y_p if abs(rate - 1.0) < 1e-6
+                    else librosa.effects.time_stretch(y=y_p, rate=rate))
+            tag = f"p{n_steps:+g}_r{rate:g}" if (n_steps or rate != 1.0) else "orig"
+            yield tag, y_pr
+
+
+def extract_split(clips, rmvpe, device, min_frames, split_name,
+                  pitch_semitones=(), time_rates=()):
     mel_chunks, f0_chunks, vad_chunks = [], [], []
     technique_labels, lengths, singer_ids = [], [], []
     skipped = 0
@@ -217,27 +252,29 @@ def extract_split(clips, rmvpe, device, min_frames, split_name):
             skipped += 1
             continue
 
-        log_mel = extract_mel(y)                                         # (T_mel, 40)
-        f0_hz   = rmvpe.infer_from_audio(y, sample_rate=SR, device=device).astype(np.float32)  # (T_rmvpe,)
-        T       = min(len(log_mel), len(f0_hz))
-        if T < min_frames:
-            skipped += 1
-            continue
-
-        log_mel = log_mel[:T]
-        f0_hz   = f0_hz[:T]
-        frame_vad = extract_vad(y, T)
-
-        # Clip-level binary technique label vector
+        # Clip-level binary technique label — same for every augmented variant.
         label = np.zeros(len(TECHNIQUE_NAMES), dtype=np.float32)
         label[tech_idx] = 1.0
 
-        mel_chunks.append(log_mel)
-        f0_chunks.append(f0_hz)
-        vad_chunks.append(frame_vad)
-        technique_labels.append(label)
-        lengths.append(T)
-        singer_ids.append(singer)
+        for _tag, y_var in _augment_variants(y, SR, pitch_semitones, time_rates):
+            log_mel = extract_mel(y_var)                                     # (T_mel, 40)
+            f0_hz   = rmvpe.infer_from_audio(
+                y_var, sample_rate=SR, device=device).astype(np.float32)     # (T_rmvpe,)
+            T       = min(len(log_mel), len(f0_hz))
+            if T < min_frames:
+                skipped += 1
+                continue
+
+            log_mel = log_mel[:T]
+            f0_hz   = f0_hz[:T]
+            frame_vad = extract_vad(y_var, T)
+
+            mel_chunks.append(log_mel)
+            f0_chunks.append(f0_hz)
+            vad_chunks.append(frame_vad)
+            technique_labels.append(label.copy())
+            lengths.append(T)
+            singer_ids.append(singer)
 
     return (mel_chunks, f0_chunks, vad_chunks,
             technique_labels, lengths, singer_ids, skipped)
@@ -310,8 +347,16 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    if args.pitch_shift_semitones or args.time_stretch_rates:
+        n_var = (len(args.pitch_shift_semitones) + 1) * (len(args.time_stretch_rates) + 1)
+        print(f"\nTRAIN-split augmentation: pitch={args.pitch_shift_semitones or '—'} "
+              f"time={args.time_stretch_rates or '—'} → {n_var}× variants/clip "
+              f"(test split NOT augmented)")
+
     print("\nExtracting training split ...")
-    tr = extract_split(train_clips, rmvpe, args.device, min_frames, "train")
+    tr = extract_split(train_clips, rmvpe, args.device, min_frames, "train",
+                       pitch_semitones=args.pitch_shift_semitones,
+                       time_rates=args.time_stretch_rates)
     save_split(
         os.path.join(args.output_dir, "technique_train.npz"),
         *tr[:-1],   # mel, f0, vad, technique, lengths, singers
@@ -319,6 +364,7 @@ def main():
     print(f"  Skipped: {tr[-1]}")
 
     print("\nExtracting test split ...")
+    # Test split is never augmented — augmenting eval data inflates metrics.
     te = extract_split(test_clips, rmvpe, args.device, min_frames, "test")
     save_split(
         os.path.join(args.output_dir, "technique_test.npz"),

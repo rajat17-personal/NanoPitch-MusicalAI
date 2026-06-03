@@ -54,14 +54,20 @@ CCMUSIC_DIMS = [
 
 # ── Model inference ───────────────────────────────────────────────────────────
 
-def _score_clips(model, mel_flat, lengths, device, batch_size=32):
+def _score_clips(model, mel_flat, lengths, device):
     """
     Run the quality head over a flat packed mel array, return per-clip scores.
 
+    The quality head pools over time internally (x.mean(dim=1)) and returns
+    a clip-level vector of shape (B, Q). For long clips we split into chunks
+    of <=1200 frames and average the chunk scores weighted by chunk length
+    (approximates full-clip mean-pooling without loading the whole clip at once).
+
     mel_flat : (total_frames, 40) float16
     lengths  : (n_clips,) int32
-    Returns  : list of np.ndarray, one per clip — shape (n_dims,) or scalar
-               Clips with zero voiced frames are returned as None.
+    Returns  : list — one entry per clip:
+                 float        if quality_dims == 1
+                 np.ndarray   of shape (Q,) if quality_dims > 1
     """
     model.eval()
     scores = []
@@ -72,44 +78,43 @@ def _score_clips(model, mel_flat, lengths, device, batch_size=32):
             mel_clip = mel_flat[offset: offset + length].astype(np.float32)
             offset += length
 
-            # Chunk long clips to avoid OOM (max 1200 frames ~12s)
             chunk_size = 1200
-            frame_scores = []
-            frame_vad    = []
+            chunk_scores = []
+            chunk_weights = []
             for start in range(0, len(mel_clip), chunk_size):
                 chunk = mel_clip[start: start + chunk_size]
                 t = torch.from_numpy(chunk).unsqueeze(0).to(device)  # (1, T, 40)
                 out = model(t)
-                # out: (vad, pitch, technique, quality, note_onset, note_offset[, emb])
-                vad_logit = out[0].squeeze(0).squeeze(-1)   # (T,)
-                q_out     = out[3]                          # (1, T, dims) or None
+                q_out = out[3]   # (1, Q) — clip-level after internal mean-pool
                 if q_out is None:
                     raise RuntimeError(
-                        "Checkpoint has no quality head — was it trained with --quality-variant?")
-                q_out = q_out.squeeze(0)                    # (T, dims)
-                frame_scores.append(q_out.cpu().numpy())
-                frame_vad.append(torch.sigmoid(vad_logit).cpu().numpy())
+                        "Checkpoint has no quality head. "
+                        "Use a checkpoint trained with --quality-variant.")
+                chunk_scores.append(q_out.squeeze(0).cpu().numpy())   # (Q,) or (1,)
+                chunk_weights.append(len(chunk))
 
-            all_scores = np.concatenate(frame_scores, axis=0)   # (T, dims)
-            all_vad    = np.concatenate(frame_vad,    axis=0)   # (T,)
+            weights = np.array(chunk_weights, dtype=np.float32)
+            weights /= weights.sum()
+            clip_score = sum(w * s for w, s in zip(weights, chunk_scores))
 
-            voiced_mask = all_vad > 0.5
-            if voiced_mask.sum() == 0:
-                scores.append(None)
-                continue
-
-            clip_score = all_scores[voiced_mask].mean(axis=0)   # (dims,) or (1,)
-            if clip_score.shape == (1,):
-                clip_score = float(clip_score[0])
-            scores.append(clip_score)
+            if hasattr(clip_score, 'shape') and clip_score.shape == (1,):
+                scores.append(float(clip_score[0]))
+            else:
+                scores.append(float(clip_score) if np.isscalar(clip_score) else clip_score)
 
     return scores
 
 
 # ── Evaluation tasks ──────────────────────────────────────────────────────────
 
-def eval_mse(model, npz_path, device):
-    """Spearman ρ / Pearson r / MAE against SingMOS-Pro scalar scores."""
+def eval_mse(model, npz_path, device, norm=None):
+    """Spearman ρ / Pearson r / MAE against SingMOS-Pro scalar scores.
+
+    If the checkpoint was trained with z-scored targets, `norm` carries
+    {'mse_mean','mse_std'} and predictions are de-normalised back to the
+    raw [1,5] scale before comparison. (ρ/r are scale-invariant, but MAE
+    and the printed pred-range only make sense after de-normalisation.)
+    """
     from scipy.stats import spearmanr, pearsonr
 
     d = np.load(npz_path, allow_pickle=True)
@@ -120,10 +125,16 @@ def eval_mse(model, npz_path, device):
     print(f"\n  quality_mse: {len(lengths):,} clips, {mel_flat.shape[0]:,} frames")
     raw = _score_clips(model, mel_flat, lengths, device)
 
+    mse_mean = float(norm.get("mse_mean", 0.0)) if norm else 0.0
+    mse_std  = float(norm.get("mse_std", 1.0))  if norm else 1.0
+    if norm and "mse_mean" in norm:
+        print(f"  De-normalising preds: μ={mse_mean:.3f} σ={mse_std:.3f}")
+
     pred, ref = [], []
     for i, s in enumerate(raw):
         if s is not None:
-            pred.append(float(s) if isinstance(s, (float, np.floating)) else float(np.mean(s)))
+            val = float(s) if isinstance(s, (float, np.floating)) else float(np.mean(s))
+            pred.append(val * mse_std + mse_mean)
             ref.append(float(gt[i]))
 
     pred = np.array(pred)
@@ -145,8 +156,13 @@ def eval_mse(model, npz_path, device):
             "mae": mae, "n_clips": len(pred), "n_skipped": skipped}
 
 
-def eval_ccmusic(model, npz_path, device):
-    """Per-dim Spearman ρ and MAE against 9-dim ccmusic expert labels."""
+def eval_ccmusic(model, npz_path, device, norm=None):
+    """Per-dim Spearman ρ and MAE against 9-dim ccmusic expert labels.
+
+    If trained with per-dim z-scored targets, `norm` carries
+    {'ccmusic_mean','ccmusic_std'} (length-9 lists) and predictions are
+    de-normalised per dimension before comparison.
+    """
     from scipy.stats import spearmanr
 
     d = np.load(npz_path, allow_pickle=True)
@@ -157,6 +173,14 @@ def eval_ccmusic(model, npz_path, device):
     print(f"\n  quality_ccmusic: {len(lengths):,} clips, {mel_flat.shape[0]:,} frames")
     raw = _score_clips(model, mel_flat, lengths, device)
 
+    if norm and "ccmusic_mean" in norm:
+        cc_mean = np.asarray(norm["ccmusic_mean"], dtype=np.float32)  # (9,)
+        cc_std  = np.asarray(norm["ccmusic_std"],  dtype=np.float32)  # (9,)
+        print(f"  De-normalising per-dim (μ range [{cc_mean.min():.2f},{cc_mean.max():.2f}])")
+    else:
+        cc_mean = np.zeros(9, dtype=np.float32)
+        cc_std  = np.ones(9, dtype=np.float32)
+
     pred_list, ref_list = [], []
     for i, s in enumerate(raw):
         if s is not None:
@@ -165,7 +189,7 @@ def eval_ccmusic(model, npz_path, device):
                 raise RuntimeError(
                     f"Expected 9-dim quality head output, got {arr.shape[0]}. "
                     "Is this a V2 checkpoint (--quality-variant 2)?")
-            pred_list.append(arr)
+            pred_list.append(arr * cc_std + cc_mean)
             ref_list.append(gt[i])
 
     pred = np.stack(pred_list)   # (n, 9)
@@ -324,6 +348,7 @@ def main():
     model  = build_model(arch, causal=causal, **kwargs).to(device)
     model.load_state_dict(ckpt["state_dict"])
     epoch  = ckpt.get("epoch", "?")
+    norm   = ckpt.get("quality_norm", {}) or {}
     run_name = args.run_name or _infer_run_name(args.checkpoint)
 
     q_dims = getattr(model, "quality_dims", 0)
@@ -347,17 +372,18 @@ def main():
         "checkpoint": args.checkpoint,
         "epoch":     epoch,
         "quality_dims": q_dims,
+        "quality_norm": norm,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "results":   {},
     }
 
     if args.mse_npz:
         print(f"\n── V3/MSE  (SingMOS-Pro distillation) {'─'*40}")
-        record["results"]["mse"] = eval_mse(model, args.mse_npz, device)
+        record["results"]["mse"] = eval_mse(model, args.mse_npz, device, norm)
 
     if args.ccmusic_npz:
         print(f"\n── V2/ccmusic  (9-dim expert labels) {'─'*41}")
-        record["results"]["ccmusic"] = eval_ccmusic(model, args.ccmusic_npz, device)
+        record["results"]["ccmusic"] = eval_ccmusic(model, args.ccmusic_npz, device, norm)
 
     if args.pairs_npz:
         print(f"\n── V1/pairs  (ranking accuracy) {'─'*46}")

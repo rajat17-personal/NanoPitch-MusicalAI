@@ -69,7 +69,39 @@ def parse_args():
                    help="path to the RMVPE checkpoint (default: rmvpe.pt)")
     p.add_argument("--min-duration", type=float, default=0.5,
                    help="skip clips shorter than this many seconds (default: 0.5)")
+    p.add_argument("--pitch-shift-semitones", type=float, nargs="*", default=[],
+                   help="extra pitch-shifted copies of every clip, in semitones "
+                        "(e.g. -2 -1 1 2). Each value adds one augmented variant. "
+                        "f0/VAD/mel are RE-DERIVED from the shifted audio, so labels "
+                        "stay exact — no manual label transform. The unshifted original "
+                        "is always kept. Combined with --time-stretch-rates as a grid.")
+    p.add_argument("--time-stretch-rates", type=float, nargs="*", default=[],
+                   help="extra time-stretched copies, as rate factors (e.g. 0.9 1.1; "
+                        ">1 = faster/shorter, <1 = slower/longer). Labels are re-derived "
+                        "from the stretched audio so frame counts and onsets stay correct. "
+                        "The rate-1.0 original is always kept. Crosses with "
+                        "--pitch-shift-semitones (P shifts × R rates variants per clip).")
     return p.parse_args()
+
+
+def _augment_variants(y, sr, pitch_semitones, time_rates):
+    """Yield (label, audio) pairs: the original plus every pitch×time variant.
+
+    pitch_shift / time_stretch are applied on raw audio BEFORE feature
+    extraction, so re-running mel/F0/VAD on each variant produces correctly
+    aligned labels (no manual label warping — the source of the reverb-aug
+    label-misalignment failure)."""
+    # Always include the unmodified original (0 semitones, rate 1.0).
+    pitches = [0.0] + [s for s in pitch_semitones if abs(s) > 1e-6]
+    rates   = [1.0] + [r for r in time_rates if abs(r - 1.0) > 1e-6]
+    for n_steps in pitches:
+        y_p = (y if abs(n_steps) < 1e-6
+               else librosa.effects.pitch_shift(y=y, sr=sr, n_steps=n_steps))
+        for rate in rates:
+            y_pr = (y_p if abs(rate - 1.0) < 1e-6
+                    else librosa.effects.time_stretch(y=y_p, rate=rate))
+            tag = f"p{n_steps:+g}_r{rate:g}" if (n_steps or rate != 1.0) else "orig"
+            yield tag, y_pr
 
 
 def extract_mel(y: np.ndarray) -> np.ndarray:
@@ -128,12 +160,18 @@ def main():
     rmvpe = RMVPE(args.rmvpe_model, hop_length=HOP_LENGTH)
 
     # ── Collect audio files ─────────────────────────────────────────────
+    # Skip macOS AppleDouble junk: a Mac-created zip carries a parallel
+    # __MACOSX/ tree of "._name.wav" resource-fork stubs that aren't real audio
+    # — they only fail to load (slowly, via the audioread fallback). Excluding
+    # them here avoids thousands of guaranteed-fail loads.
     audio_exts = {".wav", ".flac", ".mp3", ".ogg"}
     files = sorted(
         os.path.join(root, f)
         for root, _, fnames in os.walk(args.dataset_dir)
+        if "__MACOSX" not in root.split(os.sep)
         for f in fnames
         if os.path.splitext(f)[1].lower() in audio_exts
+        and not f.startswith("._")
     )
     if not files:
         raise SystemExit(f"No audio files found in {args.dataset_dir}")
@@ -156,30 +194,36 @@ def main():
             skipped += 1
             continue
 
-        # ── Mel ──────────────────────────────────────────────────────────
-        log_mel = extract_mel(y)          # (T_mel, 40)
+        # Original clip + every pitch×time augmentation variant. Features are
+        # re-extracted per variant, so labels are always correctly aligned.
+        for _tag, y_var in _augment_variants(
+                y, SR, args.pitch_shift_semitones, args.time_stretch_rates):
 
-        # ── F0 (RMVPE) ───────────────────────────────────────────────────
-        # infer() returns f0 in Hz; 0.0 marks unvoiced frames.
-        f0_hz = rmvpe.infer_from_audio(y, sample_rate=SR, device=args.device).astype(np.float32)  # (T_rmvpe,)
+            # ── Mel ──────────────────────────────────────────────────────
+            log_mel = extract_mel(y_var)          # (T_mel, 40)
 
-        # ── Temporal alignment ───────────────────────────────────────────
-        # mel and RMVPE use the same hop but may differ by ±1 frame due to
-        # different internal padding conventions — use the shorter length.
-        T = min(len(log_mel), len(f0_hz))
-        if T < min_frames:
-            skipped += 1
-            continue
-        log_mel = log_mel[:T]
-        f0_hz   = f0_hz[:T]
+            # ── F0 (RMVPE) ───────────────────────────────────────────────
+            # infer() returns f0 in Hz; 0.0 marks unvoiced frames.
+            f0_hz = rmvpe.infer_from_audio(
+                y_var, sample_rate=SR, device=args.device).astype(np.float32)
 
-        # ── VAD ──────────────────────────────────────────────────────────
-        frame_vad = extract_vad(y, T)    # (T,)
+            # ── Temporal alignment ───────────────────────────────────────
+            # mel and RMVPE use the same hop but may differ by ±1 frame due to
+            # different internal padding conventions — use the shorter length.
+            T = min(len(log_mel), len(f0_hz))
+            if T < min_frames:
+                skipped += 1
+                continue
+            log_mel = log_mel[:T]
+            f0_hz   = f0_hz[:T]
 
-        mel_chunks.append(log_mel)
-        f0_chunks.append(f0_hz)
-        vad_chunks.append(frame_vad)
-        lengths.append(T)
+            # ── VAD ──────────────────────────────────────────────────────
+            frame_vad = extract_vad(y_var, T)    # (T,)
+
+            mel_chunks.append(log_mel)
+            f0_chunks.append(f0_hz)
+            vad_chunks.append(frame_vad)
+            lengths.append(T)
 
     if not mel_chunks:
         raise SystemExit("No valid clips extracted — check --dataset-dir and --min-duration.")
